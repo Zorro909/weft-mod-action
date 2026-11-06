@@ -151,3 +151,7 @@ python3 -m unittest discover -s tests   # needs cargo for the plan tests
 `weftmod.py` does the work, with the Python standard library only, so that it runs on every runner
 without a setup step. The workflow `test.yml` also builds and packs `tests/fixture` on all three
 systems. Tag releases `v1.x.y` and move the `v1` tag to the newest.
+
+## License
+
+[MIT](LICENSE)
