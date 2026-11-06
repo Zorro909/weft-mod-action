@@ -1,0 +1,75 @@
+name: Propose Weft mods for the index
+description: >-
+  Opens a pull request on the Weft mod index that adds releases of this repository's mods. The
+  index's own tool writes the files, after checking each release; a reviewer of the index then
+  reads the mod's source and merges.
+inputs:
+  token:
+    description: >-
+      A classic personal access token, with the scope `public_repo`, of the account that opens the
+      pull request; the index is forked to that account. GITHUB_TOKEN can't do this, since it only
+      works in this repository.
+    required: true
+  tags:
+    description: The release tags to add, separated by spaces. Default, the newest release of each mod.
+    default: ""
+  mods:
+    description: The mod folders (for the default tags), one per line.
+    default: "."
+  index:
+    description: The index repository.
+    default: Zorro909/weft-mods-index
+  index-ref:
+    description: The branch of the index to propose to.
+    default: main
+outputs:
+  url:
+    description: The pull request.
+    value: ${{ steps.pr.outputs.url }}
+runs:
+  using: composite
+  steps:
+    - id: pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        TAGS: ${{ inputs.tags }}
+        MODS: ${{ inputs.mods }}
+        INDEX: ${{ inputs.index }}
+        INDEX_REF: ${{ inputs.index-ref }}
+      run: |
+        set -euo pipefail
+        source "$GITHUB_ACTION_PATH/../python.sh"
+        tags=${TAGS:-$(python "$GITHUB_ACTION_PATH/../weftmod.py" latest-tags --mods "$MODS")}
+        user=$(gh api user --jq .login)
+        echo "Proposing $tags to $INDEX as $user"
+
+        # The index's owner pushes a branch to it; anyone else to their fork of it.
+        if [ "$user" = "${INDEX%%/*}" ]; then
+          push_repo=$INDEX
+        else
+          push_repo=$user/${INDEX#*/}
+          gh repo fork "$INDEX" --clone=false --default-branch-only >/dev/null 2>&1 || true
+          for _ in 1 2 3 4 5 6 7 8 9 10; do gh repo view "$push_repo" >/dev/null 2>&1 && break; sleep 3; done
+        fi
+
+        index="$RUNNER_TEMP/weft-mods-index"
+        git clone -q --branch "$INDEX_REF" "https://github.com/$INDEX.git" "$index"
+        cd "$index"
+        python -m weftindex add-release "$GITHUB_REPOSITORY" $tags
+        title=$(cat dist/pr-title.txt)
+        branch="add/$GITHUB_REPOSITORY/${tags// /+}"
+        git add mods weft.toml
+        git -c user.name="$user" -c user.email="$user@users.noreply.github.com" commit -qm "$title"
+        git push -qf "https://x-access-token:$GH_TOKEN@github.com/$push_repo.git" "HEAD:refs/heads/$branch"
+
+        url=$(gh pr list --repo "$INDEX" --head "$branch" --state open --json url --jq '.[0].url // ""')
+        if [ -z "$url" ]; then
+          head=$branch
+          if [ "$push_repo" != "$INDEX" ]; then head=$user:$branch; fi
+          url=$(gh pr create --repo "$INDEX" --base "$INDEX_REF" --head "$head" --title "$title" \
+            --body-file dist/pr.md)
+        fi
+        echo "url=$url" >> "$GITHUB_OUTPUT"
+        echo "### Pull request: $url" >> "$GITHUB_STEP_SUMMARY"

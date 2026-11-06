@@ -1,0 +1,56 @@
+name: Build Weft mods
+description: >-
+  Decides which mods to release and at which version, sets those versions, and builds the mods for
+  this runner's system. Run it on Windows, Linux and macOS, then run the release action.
+inputs:
+  mods:
+    description: The mod folders, one per line, relative to the repository root.
+    default: "."
+  release-unchanged:
+    description: Also release a mod when nothing in its folder changed since its newest release.
+    default: "false"
+  cargo-args:
+    description: More arguments for `cargo build --release`, such as `--features x`.
+    default: ""
+  rust-toolchain:
+    description: The Rust toolchain to install; empty to use the runner's.
+    default: stable
+  github-token:
+    description: Reads which tags exist.
+    default: ${{ github.token }}
+outputs:
+  tags:
+    description: The tags this run releases, separated by spaces; empty when there is nothing new.
+    value: ${{ steps.build.outputs.tags }}
+runs:
+  using: composite
+  steps:
+    - if: inputs.rust-toolchain != ''
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+
+    - id: build
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        MODS: ${{ inputs.mods }}
+        RELEASE_UNCHANGED: ${{ inputs.release-unchanged }}
+        CARGO_ARGS: ${{ inputs.cargo-args }}
+      run: |
+        source "$GITHUB_ACTION_PATH/../python.sh"
+        out="$RUNNER_TEMP/weft-mod-build"
+        mkdir -p "$out/libraries"
+        flag=()
+        if [ "$RELEASE_UNCHANGED" = true ]; then flag=(--release-unchanged); fi
+        python "$GITHUB_ACTION_PATH/../weftmod.py" plan --mods "$MODS" "${flag[@]}" --out "$out/plan.json"
+        python "$GITHUB_ACTION_PATH/../weftmod.py" build --plan "$out/plan.json" \
+          --out "$out/libraries" --cargo-args "$CARGO_ARGS"
+        tags=$(python -c 'import json,sys; print(" ".join(e["tag"] for e in json.load(open(sys.argv[1]))))' "$out/plan.json")
+        echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: weft-mod-build-${{ runner.os }}-${{ runner.arch }}
+        path: ${{ runner.temp }}/weft-mod-build
+        retention-days: 7

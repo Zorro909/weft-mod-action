@@ -1,0 +1,3 @@
+mod.hello_weft.name = Hello Weft
+mod.hello_weft.description = A mod that does nothing. It tests weft-mod-action.
+mod.hello_weft.authors = Zorro909

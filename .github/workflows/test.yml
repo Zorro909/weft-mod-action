@@ -1,0 +1,72 @@
+# Tests weftmod.py, then runs the build and release actions on tests/fixture, as a mod repository
+# would, without making a release. Last, checks the package they made.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    strategy:
+      matrix:
+        python: ["3.10", "3.14"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./build
+        with:
+          mods: tests/fixture
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: release
+        uses: ./release
+        with:
+          github-release: false
+          attest: false
+      - name: Check the package
+        env:
+          TAGS: ${{ steps.release.outputs.tags }}
+        run: |
+          set -euo pipefail
+          test "$TAGS" = hello_weft-v0.1.0
+          dist="$RUNNER_TEMP/weft-mod-dist/$TAGS"
+          unzip -l "$dist/hello_weft.zip"
+          cat "$dist/hello_weft.mod.json"
+          python3 - "$dist" <<'EOF'
+          import hashlib, json, sys, zipfile
+          from pathlib import Path
+          dist = Path(sys.argv[1])
+          info = json.loads((dist / "hello_weft.mod.json").read_text())
+          data = (dist / "hello_weft.zip").read_bytes()
+          assert info["platforms"] == ["windows-x64", "linux-x64", "macos-arm64"], info
+          assert info["weft"]["tag"] == "v26.11.2", info["weft"]
+          assert info["deps"] == [{"id": "base"}], info["deps"]
+          assert info["name"] == "Hello Weft" and info["summary"] == "A mod that does nothing.", info
+          assert info["asset"]["sha256"] == hashlib.sha256(data).hexdigest()
+          names = zipfile.ZipFile(dist / "hello_weft.zip").namelist()
+          assert {"hello_weft.dll", "libhello_weft.so", "libhello_weft.dylib",
+                  "assets/lang/en_us.lang", "assets/textures/gui/icon.png"} == set(names), names
+          EOF

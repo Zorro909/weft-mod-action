@@ -1,0 +1,15 @@
+# The smallest Weft mod: what the action's own CI builds and releases (without publishing it).
+[package]
+name = "hello_weft"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A mod that does nothing, for testing weft-mod-action."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "v26.11.2" }
+
+[workspace]
