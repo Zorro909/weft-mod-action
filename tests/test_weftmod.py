@@ -179,12 +179,19 @@ class Plan(unittest.TestCase):
         self.assertEqual(e, {"folder": "tests/fixture", "id": "hello_weft", "version": "0.1.0",
                              "tag": "hello_weft-v0.1.0", "kind": "release", "since": ""})
 
-    def test_a_released_version_becomes_an_rc_after_the_newest_tag(self):
-        changed = {f"/repos/{self.REPO}/compare/hello_weft-v0.3.0...{SHA}":
-                   {"files": [{"filename": "tests/fixture/src/lib.rs"}]}}
-        [e] = self.plan({**self.tags("0.1.0", "0.3.0"), **changed})
+    def changed(self, since):
+        return {f"/repos/{self.REPO}/compare/hello_weft-v{since}...{SHA}":
+                {"files": [{"filename": "tests/fixture/src/lib.rs"}]}}
+
+    def test_a_released_version_becomes_an_rc_after_the_newest_full_release(self):
+        [e] = self.plan({**self.tags("0.1.0", "0.3.0"), **self.changed("0.3.0")})
         self.assertEqual((e["version"], e["kind"], e["since"]),
                          ("0.3.1-rc.42.g0123456", "rc", "hello_weft-v0.3.0"))
+
+    def test_candidates_dont_raise_the_next_rc(self):
+        [e] = self.plan({**self.tags("0.1.0", "0.1.1-rc.3"), **self.changed("0.1.1-rc.3")})
+        self.assertEqual((e["version"], e["kind"], e["since"]),
+                         ("0.1.1-rc.42.g0123456", "rc", "hello_weft-v0.1.1-rc.3"))
 
     def test_an_unchanged_mod_is_skipped(self):
         same = {f"/repos/{self.REPO}/compare/hello_weft-v0.1.0...{SHA}":

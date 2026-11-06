@@ -162,11 +162,11 @@ def rc_version(version: str, run: str, sha: str) -> str:
     return f"{major}.{minor}.{patch + 1}-rc.{run}.g{sha[:7]}"
 
 
-def newest_tag(gh: GitHub, repo: str, mod_id: str) -> str | None:
+def tag_versions(gh: GitHub, repo: str, mod_id: str) -> list[str]:
+    """The versions of the mod's `<id>-v<version>` tags, oldest first: releases and candidates."""
     refs = gh.api(f"/repos/{repo}/git/matching-refs/tags/{mod_id}-v") or []
-    tags = [r["ref"].removeprefix("refs/tags/") for r in refs]
-    tags = [t for t in tags if SEMVER_RE.match(t.removeprefix(f"{mod_id}-v"))]
-    return max(tags, key=lambda t: semver_key(t.removeprefix(f"{mod_id}-v")), default=None)
+    versions = [r["ref"].removeprefix(f"refs/tags/{mod_id}-v") for r in refs]
+    return sorted((v for v in versions if SEMVER_RE.match(v)), key=semver_key)
 
 
 def semver_key(version: str) -> tuple:
@@ -202,23 +202,24 @@ def plan(gh: GitHub, root: Path, folders: list[Path], repo: str, sha: str, run: 
          release_unchanged: bool = False) -> list[dict]:
     """One entry per mod to release: its folder, id, version and tag, `rc` or `release`, and the
     tag it follows. A mod whose version is released already becomes the next release candidate
-    after it, or after the mod's newest release if that is newer;
-    unless nothing under its folder (or a Weft submodule) changed since its newest release, when
-    it is left out."""
+    after it, or after the mod's newest full release if that is newer (candidates never raise it);
+    unless nothing under its folder (or a Weft submodule) changed since its newest tag, when it is
+    left out."""
     out = []
     submodules = weft_submodules(root)
     for folder in folders:
         mod = Mod(folder)
         rel = folder.resolve().relative_to(root.resolve()).as_posix()
         rel = "" if rel == "." else rel
-        version, since = mod.version, newest_tag(gh, repo, mod.id)
+        versions = tag_versions(gh, repo, mod.id)
+        version, since = mod.version, f"{mod.id}-v{versions[-1]}" if versions else None
         if tag_exists(gh, repo, f"{mod.id}-v{version}"):
             if not release_unchanged and since and not changed_since(
                     gh, repo, since, sha, [rel, *submodules] if rel else [""]):
                 log(f"{mod.id}: nothing changed since {since}, nothing to release")
                 continue
-            newest = since.removeprefix(f"{mod.id}-v") if since else version
-            version = rc_version(max(version, newest, key=semver_key), run, sha)
+            released = [v for v in versions if "-" not in v]
+            version = rc_version(max([version, *released], key=semver_key), run, sha)
             if tag_exists(gh, repo, f"{mod.id}-v{version}"):
                 raise Error(f"{mod.id}: {mod.id}-v{version} exists already; this run was released")
         kind = "release" if "-" not in version else "rc"

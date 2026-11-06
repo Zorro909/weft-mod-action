@@ -63,8 +63,8 @@ For each mod, `build` reads the version in its `Cargo.toml`:
 | The tag `<id>-v<version>` | What happens |
 | --- | --- |
 | doesn't exist | The mod is released at that version: a release for `X.Y.Z`, a prerelease for `X.Y.Z-rc.1` and the like. |
-| exists, and the mod changed since its newest release | A release candidate after the newer of that version and the newest release: `X.Y.(Z+1)-rc.<run>.g<sha7>`, for example `0.2.2-rc.57.g1a2b3c4`. `<run>` is the workflow's run number, `<sha7>` the commit. |
-| exists, and the mod didn't change | Nothing. Set `release-unchanged: true` to make a release candidate anyway. |
+| exists, and the mod changed since its newest tag | A release candidate after the newer of that version and the newest full release (`X.Y.Z`; release candidates don't count): `X.Y.(Z+1)-rc.<run>.g<sha7>`, for example `0.2.2-rc.57.g1a2b3c4`. `<run>` is the workflow's run number, `<sha7>` the commit. |
+| exists, and the mod didn't change since its newest tag | Nothing. Set `release-unchanged: true` to make a release candidate anyway. |
 
 A mod changed when a file under its folder, or a Weft submodule, changed. For a mod at the
 repository root, any file counts.
