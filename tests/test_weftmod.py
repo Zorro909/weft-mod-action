@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import shutil
 import struct
@@ -113,14 +115,6 @@ class Metadata(unittest.TestCase):
             with self.assertRaisesRegex(weftmod.Error, r"package\.metadata\.weft"):
                 weftmod.parse_deps(src, "m")
 
-    def test_summary(self):
-        self.assertEqual(weftmod.summarize("{gold}Gears{/} and belts. More later.\\nNext line"),
-                         "Gears and belts.")
-        long = "word " * 60
-        s = weftmod.summarize(long)
-        self.assertLessEqual(len(s), weftmod.SUMMARY_MAX)
-        self.assertTrue(s.endswith("…"))
-
     def test_lang(self):
         self.assertEqual(weftmod.parse_lang("# c\na.b = x = y\n\nbad\n"), {"a.b": "x = y"})
 
@@ -129,21 +123,50 @@ class Metadata(unittest.TestCase):
         self.assertEqual(weftmod.fnv1a64(b"a"), "af63dc4c8601ec8c")
 
 
-class WeftName(unittest.TestCase):
-    def test_exact_tag_or_describe_name(self):
-        tags = [{"name": "v26.11.1", "commit": {"sha": "a" * 40}},
-                {"name": "v26.11.2", "commit": {"sha": "b" * 40}},
-                {"name": "nightly", "commit": {"sha": "c" * 40}}]
-        base = f"/repos/{weftmod.WEFT_REPO}"
-        gh = FakeGitHub({
-            f"{base}/tags": tags,
-            f"{base}/compare/v26.11.1...{'c' * 40}": {"status": "ahead", "ahead_by": 9},
-            f"{base}/compare/v26.11.2...{'c' * 40}": {"status": "ahead", "ahead_by": 3},
-        })
-        self.assertEqual(weftmod.weft_name(gh, "b" * 40), "v26.11.2")
-        self.assertEqual(weftmod.weft_name(gh, "c" * 40), "v26.11.2-3-gccccccc")
-        with self.assertRaises(weftmod.Error):
-            weftmod.weft_name(gh, "d" * 40)
+class Toml(unittest.TestCase):
+    FIELDS = {"id": "m", "name": 'A "quoted" mod\n', "version": "0.1.1-rc.4.gabcdef0",
+              "abi": "f470b1cbb1f9ad91", "deps": ["base", "cogwork"]}
+
+    def test_weft_mod_toml(self):
+        self.assertEqual(weftmod.to_toml(self.FIELDS),
+                         'id = "m"\nname = "A \\"quoted\\" mod\\n"\n'
+                         'version = "0.1.1-rc.4.gabcdef0"\nabi = "f470b1cbb1f9ad91"\n'
+                         'deps = ["base", "cogwork"]\n')
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib is Python 3.11+")
+    def test_reads_back_as_toml(self):
+        import tomllib
+        self.assertEqual(tomllib.loads(weftmod.to_toml(self.FIELDS)), self.FIELDS)
+
+
+def bundle(*digests: str) -> dict:
+    statement = {"_type": "https://in-toto.io/Statement/v1",
+                 "subject": [{"name": "x.zip", "digest": {"sha256": d}} for d in digests]}
+    return {"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "dsseEnvelope": {"payload": base64.b64encode(json.dumps(statement).encode()).decode(),
+                             "payloadType": "application/vnd.in-toto+json"}}
+
+
+class Attach(TempDir):
+    def test_each_zip_gets_the_bundle_that_names_it(self):
+        entries = []
+        for mod_id in ("a", "b"):
+            (self.tmp / f"{mod_id}-v1.0.0").mkdir()
+            (self.tmp / f"{mod_id}-v1.0.0" / f"{mod_id}.zip").write_bytes(mod_id.encode())
+            entries.append({"id": mod_id, "tag": f"{mod_id}-v1.0.0"})
+        a, b = (hashlib.sha256(x).hexdigest() for x in (b"a", b"b"))
+        lines = self.tmp / "attestation.jsonl"
+        lines.write_text(json.dumps(bundle("0" * 64)) + "\n" + json.dumps(bundle(b, a)) + "\n")
+        weftmod.attach(entries, self.tmp, weftmod.read_bundles(lines))
+        for mod_id in ("a", "b"):
+            info = json.loads((self.tmp / f"{mod_id}-v1.0.0" / f"{mod_id}.mod.json").read_text())
+            self.assertEqual(info, {"attestation": bundle(b, a)})
+
+    def test_a_zip_without_a_bundle_fails(self):
+        one = self.tmp / "bundle.json"
+        one.write_text(json.dumps(bundle("0" * 64), indent=2))
+        with self.assertRaisesRegex(weftmod.Error, "no attestation"):
+            weftmod.bundle_for("1" * 64, weftmod.read_bundles(one))
 
 
 class Folders(TempDir):
@@ -216,23 +239,24 @@ class Pack(TempDir):
     def test_platforms_and_layout(self):
         libs, assets = self.libraries()
         out = self.tmp / "m.zip"
-        self.assertEqual(weftmod.pack("m", libs, assets, out),
+        self.assertEqual(weftmod.pack('id = "m"\n', libs, assets, out),
                          ["windows-x64", "linux-x64", "macos-arm64"])
         with zipfile.ZipFile(out) as z:
-            self.assertEqual(z.namelist(),
-                             ["libm.dylib", "libm.so", "m.dll", "assets/lang/en_us.lang"])
+            self.assertEqual(z.namelist(), ["weft-mod.toml", "libm.dylib", "libm.so", "m.dll",
+                                            "assets/lang/en_us.lang"])
+            self.assertEqual(z.read("weft-mod.toml"), b'id = "m"\n')
 
     def test_same_input_same_bytes(self):
         libs, assets = self.libraries()
-        weftmod.pack("m", libs, assets, self.tmp / "a.zip")
-        weftmod.pack("m", libs, assets, self.tmp / "b.zip")
+        weftmod.pack("", libs, assets, self.tmp / "a.zip")
+        weftmod.pack("", libs, assets, self.tmp / "b.zip")
         self.assertEqual((self.tmp / "a.zip").read_bytes(), (self.tmp / "b.zip").read_bytes())
 
     def test_a_library_must_match_its_name(self):
         libs, assets = self.libraries()
         (libs / "libm.so").write_bytes(pe())
         with self.assertRaisesRegex(weftmod.Error, "libm.so is not a library"):
-            weftmod.pack("m", libs, assets, self.tmp / "m.zip")
+            weftmod.pack("", libs, assets, self.tmp / "m.zip")
 
 
 class MergeBuilds(TempDir):

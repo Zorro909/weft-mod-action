@@ -4,8 +4,8 @@ Python 3.10 or newer, so that it runs on every GitHub runner as it is.
 
     plan        which mods to release, at which versions        (build/action.yml, on each runner)
     build       set those versions, `cargo build --release`, copy the libraries
-    package     merge the runners' builds; each mod's `<id>.zip` and `<id>.mod.json`
-                                                                 (release/action.yml)
+    package     merge the runners' builds; each mod's `<id>.zip`  (release/action.yml)
+    attach      each zip's `<id>.mod.json`, from its attestation
     release     a GitHub release of each package
     latest-tags the newest release tag of each mod                (index-pr/action.yml)
 
@@ -16,7 +16,7 @@ README.md for the rules.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+import base64
 import hashlib
 import json
 import os
@@ -31,16 +31,12 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-WEFT_REPO = "Weft-Rust/Weft"
-ABI_FILE = "crates/abi/src/lib.rs"
 PLATFORMS = ("windows-x64", "linux-x64", "macos-arm64")
 LIBRARIES = {"windows-x64": "{id}.dll", "linux-x64": "lib{id}.so", "macos-arm64": "lib{id}.dylib"}
-SUMMARY_MAX = 140
 CORE_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 _PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER_RE = re.compile(CORE_RE.pattern + rf"(?:-{_PRE_ID}(?:\.{_PRE_ID})*)?$")
 ID_RE = re.compile(r"^[a-z0-9_]+$")
-WEFT_TAG_RE = re.compile(r"^v[0-9A-Za-z.\-]+$")
 
 
 class Error(Exception):
@@ -88,16 +84,6 @@ class GitHub:
             if len(batch) < 100:
                 return out
             page += 1
-
-    def raw(self, repo: str, commit: str, path: str) -> bytes | None:
-        try:
-            with urllib.request.urlopen(
-                    f"https://raw.githubusercontent.com/{repo}/{commit}/{path}", timeout=60) as r:
-                return r.read()
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            raise Error(f"raw {repo}@{commit[:7]}/{path}: HTTP {e.code}") from None
 
 
 def tag_exists(gh: GitHub, repo: str, tag: str) -> bool:
@@ -314,26 +300,28 @@ def library_platform(path: Path) -> str:
     return platform
 
 
-def pack(mod_id: str, libraries: Path, assets: Path, zip_path: Path) -> list[str]:
-    """`<id>.zip`: the libraries at the top, then `assets/`, with fixed timestamps so that the same
-    input gives the same bytes. Returns its platforms."""
+def pack(toml: str, libraries: Path, assets: Path, zip_path: Path) -> list[str]:
+    """`<id>.zip`: `weft-mod.toml`, the libraries at the top, then `assets/`, with fixed timestamps
+    so that the same input gives the same bytes. Returns its platforms."""
     files = sorted(libraries.iterdir())
     platforms = sorted({library_platform(f) for f in files}, key=PLATFORMS.index)
     if assets.is_dir():
         files += sorted(p for p in assets.rglob("*") if p.is_file())
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in files:
-            name = f.name if f.parent == libraries else f.relative_to(assets.parent).as_posix()
+        entries = [("weft-mod.toml", toml.encode())] + [
+            (f.name if f.parent == libraries else f.relative_to(assets.parent).as_posix(),
+             f.read_bytes()) for f in files]
+        for name, data in entries:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.external_attr = 0o644 << 16
             info.compress_type = zipfile.ZIP_DEFLATED
-            z.writestr(info, f.read_bytes())
+            z.writestr(info, data)
     return platforms
 
 
 # ---------------------------------------------------------------------------------------------
-# package: <id>.mod.json
+# package: weft-mod.toml
 
 
 def parse_lang(text: str) -> dict[str, str]:
@@ -344,20 +332,6 @@ def parse_lang(text: str) -> dict[str, str]:
             k, v = line.split("=", 1)
             out[k.strip()] = v.strip()
     return out
-
-
-def summarize(description: str) -> str:
-    """The description's first sentence on one line, without color markup, at most 140 characters:
-    cut at a comma, or else a word, when it is longer."""
-    text = re.sub(r"\{[^{}]*\}", "", description)
-    text = re.split(r"\\n|\n", text)[0].strip()
-    text = " ".join(re.split(r"(?<=[.!?])\s+", text)[0].split())
-    if len(text) <= SUMMARY_MAX:
-        return text
-    cut = text[:SUMMARY_MAX - 1]
-    comma, space = cut.rfind(", "), cut.rfind(" ")
-    end = comma if comma >= SUMMARY_MAX // 2 else space if space > 0 else SUMMARY_MAX - 1
-    return cut[:end].rstrip(" ,;:") + "…"
 
 
 _COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
@@ -394,100 +368,39 @@ def fnv1a64(data: bytes) -> str:
     return f"{h:016x}"
 
 
-def weft_of(folder: Path) -> tuple[str, bytes]:
-    """The Weft commit a mod builds against, and its ABI file: from `weft_abi` in `cargo metadata`.
-    A git dependency on Weft gives the commit in its source; a path dependency (a submodule, say)
-    is a checkout whose HEAD is the commit."""
+def weft_abi(folder: Path) -> str:
+    """The mod ABI the mod builds against: the FNV-1a-64 of the `weft_abi` crate's `src/lib.rs`
+    (Weft's `crates/abi/src/lib.rs`), wherever cargo takes that crate from."""
     meta = cargo_metadata(folder, deps=True)
     abi = next((p for p in meta["packages"] if p["name"] == "weft_abi"), None)
     if abi is None:
         raise Error(f"{folder}: the mod doesn't depend on Weft (no weft_abi crate)")
-    crate = Path(abi["manifest_path"]).parent
-    source = abi.get("source") or ""
-    if source.startswith("git+"):
-        url, _, commit = source.removeprefix("git+").partition("#")
-        if not re.match(rf"https://github\.com/{WEFT_REPO}(\.git)?(\?|$)", url, re.I):
-            raise Error(f"{folder}: Weft comes from {url}, not https://github.com/{WEFT_REPO}")
-    elif not source:
-        checkout = crate.parent.parent
-        r = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True,
-                           text=True)
-        if r.returncode != 0:
-            raise Error(f"{folder}: Weft at {checkout} is not a git checkout")
-        dirty = subprocess.run(["git", "-C", str(checkout), "status", "--porcelain"],
-                               capture_output=True, text=True).stdout.strip()
-        if dirty:
-            raise Error(f"{folder}: the Weft checkout at {checkout} has local changes")
-        commit = r.stdout.strip()
-    else:
-        raise Error(f"{folder}: Weft comes from {source}, not GitHub")
-    return commit, (crate / "src" / "lib.rs").read_bytes()
+    return fnv1a64((Path(abi["manifest_path"]).parent / "src" / "lib.rs").read_bytes())
 
 
-def weft_name(gh: GitHub, commit: str) -> str:
-    """The Weft release tag at `commit`, else its `git describe --tags` name `<tag>-<n>-g<sha7>`."""
-    tags = {t["name"]: t["commit"]["sha"] for t in gh.pages(f"/repos/{WEFT_REPO}/tags")
-            if WEFT_TAG_RE.match(t["name"])}
-    exact = [t for t, c in tags.items() if c == commit]
-    if exact:
-        return max(exact, key=lambda t: semver_key(t[1:]) if SEMVER_RE.match(t[1:]) else ((), ()))
-    best = None
-    for tag in tags:
-        cmp = gh.api(f"/repos/{WEFT_REPO}/compare/{tag}...{commit}")
-        if cmp and cmp["status"] in ("ahead", "identical") \
-                and (best is None or cmp["ahead_by"] < best[1]):
-            best = (tag, cmp["ahead_by"])
-    if best is None:
-        raise Error(f"Weft commit {commit} descends from no Weft release tag")
-    return f"{best[0]}-{best[1]}-g{commit[:7]}"
-
-
-def mod_json(gh: GitHub, root: Path, entry: dict, zip_path: Path, platforms: list[str],
-             repo: str, sha: str, default_branch: str) -> dict:
+def manifest(root: Path, entry: dict) -> dict:
+    """The fields of `weft-mod.toml`: id, name, version, abi and deps."""
     folder = root / entry["folder"]
     mod = Mod(folder)
-    pkg, mod_id = mod.package, entry["id"]
-    prefix = "" if entry["folder"] == "." else entry["folder"] + "/"
-    weft = (pkg.get("metadata") or {}).get("weft") or {}
+    mod_id = entry["id"]
+    weft = (mod.package.get("metadata") or {}).get("weft") or {}
     lang_file = folder / "assets" / "lang" / "en_us.lang"
     lang = parse_lang(lang_file.read_text(encoding="utf-8")) if lang_file.is_file() else {}
-    # Each from [package.metadata.weft], else the lang file, else Cargo.toml's own field.
-    name = weft.get("name") or lang.get(f"mod.{mod_id}.name") or mod_id
-    description = (weft.get("summary") or lang.get(f"mod.{mod_id}.description")
-                   or pkg.get("description") or "")
-    lang_authors = [a.strip() for a in lang.get(f"mod.{mod_id}.authors", "").split(",")]
-    cargo_authors = [re.sub(r"\s*<[^>]*>", "", a) for a in pkg.get("authors") or []]
-    authors = (weft.get("authors") or [a for a in lang_authors if a] or cargo_authors
-               or [repo.split("/")[0]])
     deps = weft.get("deps")
     if deps is None:
         deps = parse_deps(mod.lib_rs.read_text(encoding="utf-8"), mod_id)
-    icon = folder / "assets" / "textures" / "gui" / "icon.png"
-    commit, abi_source = weft_of(folder)
-    data = zip_path.read_bytes()
-    return {
-        "schema": 1,
-        "id": mod_id,
-        "name": name,
-        "summary": summarize(description) or name,
-        "authors": authors,
-        "license": pkg.get("license"),
-        "homepage": pkg.get("homepage")
-        or f"https://github.com/{repo}/tree/{default_branch}/{prefix}".rstrip("/"),
-        "icon": f"https://raw.githubusercontent.com/{repo}/{sha}/{prefix}assets/textures/gui/icon.png"
-        if icon.is_file() and icon.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n" else None,
-        "version": entry["version"],
-        "channel": "release" if "-" not in entry["version"] else "prerelease",
-        "tag": entry["tag"],
-        "published": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": {"repo": repo, "commit": sha},
-        "weft": {"tag": weft_name(gh, commit), "commit": commit, "abi": fnv1a64(abi_source)},
-        "deps": [{"id": d} for d in deps],
-        "platforms": platforms,
-        "asset": {"name": f"{mod_id}.zip",
-                  "url": f"https://github.com/{repo}/releases/download/{entry['tag']}/{mod_id}.zip",
-                  "size": len(data), "sha256": hashlib.sha256(data).hexdigest()},
-    }
+    if not all(isinstance(d, str) and ID_RE.match(d) for d in deps):
+        raise Error(f"{mod_id}: [package.metadata.weft] deps must be mod ids, not {deps!r}")
+    return {"id": mod_id,
+            "name": weft.get("name") or lang.get(f"mod.{mod_id}.name") or mod_id,
+            "version": entry["version"],
+            "abi": weft_abi(folder),
+            "deps": deps}
+
+
+def to_toml(fields: dict) -> str:
+    """Strings and lists of strings as TOML: a JSON string is a TOML basic string."""
+    return "".join(f"{k} = {json.dumps(v, ensure_ascii=False)}\n" for k, v in fields.items())
 
 
 def merge_builds(artifacts: Path, libraries: Path) -> list[dict]:
@@ -508,29 +421,58 @@ def merge_builds(artifacts: Path, libraries: Path) -> list[dict]:
     return first
 
 
-def package(gh: GitHub, root: Path, artifacts: Path, dist: Path, repo: str, sha: str,
-            require: list[str]) -> list[dict]:
-    """`dist/<tag>/<id>.zip` and `<id>.mod.json` for each planned mod, from the downloaded builds,
-    and `dist/plan.json`. Returns the plan."""
+def package(root: Path, artifacts: Path, dist: Path, require: list[str]) -> list[dict]:
+    """`dist/<tag>/<id>.zip` for each planned mod, from the downloaded builds, and
+    `dist/plan.json`. Returns the plan."""
     libraries = dist / "libraries"
     entries = merge_builds(artifacts, libraries)
-    default_branch = (gh.api(f"/repos/{repo}") or {}).get("default_branch", "main")
     for e in entries:
         zip_path = dist / e["tag"] / f"{e['id']}.zip"
         if not (libraries / e["id"]).is_dir():
             raise Error(f"{e['id']}: no libraries were built")
-        platforms = pack(e["id"], libraries / e["id"], root / e["folder"] / "assets", zip_path)
+        fields = manifest(root, e)
+        platforms = pack(to_toml(fields), libraries / e["id"], root / e["folder"] / "assets",
+                         zip_path)
         missing = [p for p in require if p not in platforms]
         if missing:
             raise Error(f"{e['id']}: no build for {', '.join(missing)}")
-        info = mod_json(gh, root, e, zip_path, platforms, repo, sha, default_branch)
-        (zip_path.parent / f"{e['id']}.mod.json").write_text(
-            json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        deps = ", ".join(d["id"] for d in info["deps"]) or "none"
-        log(f"{e['tag']}: {', '.join(platforms)}; Weft {info['weft']['tag']}; deps {deps}")
+        log(f"{e['tag']}: {', '.join(platforms)}; ABI {fields['abi']}; "
+            f"deps {', '.join(fields['deps']) or 'none'}")
     shutil.rmtree(libraries)
     (dist / "plan.json").write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
     return entries
+
+
+# ---------------------------------------------------------------------------------------------
+# attach: <id>.mod.json
+
+
+def read_bundles(path: Path) -> list[dict]:
+    """The Sigstore bundles in the file that `actions/attest-build-provenance` names as its
+    `bundle-path`: one bundle per line (or one JSON document)."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        return [json.loads(text)]
+    except ValueError:
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def bundle_for(sha256: str, bundles: list[dict]) -> dict:
+    """The bundle whose in-toto statement has a subject with this sha256."""
+    for b in bundles:
+        statement = json.loads(base64.b64decode(b["dsseEnvelope"]["payload"]))
+        if any(s.get("digest", {}).get("sha256") == sha256 for s in statement["subject"]):
+            return b
+    raise Error(f"no attestation has the subject sha256:{sha256}")
+
+
+def attach(entries: list[dict], dist: Path, bundles: list[dict]) -> None:
+    """`<id>.mod.json` next to each zip: `{"attestation": <its bundle>}`."""
+    for e in entries:
+        folder = dist / e["tag"]
+        digest = hashlib.sha256((folder / f"{e['id']}.zip").read_bytes()).hexdigest()
+        (folder / f"{e['id']}.mod.json").write_text(
+            json.dumps({"attestation": bundle_for(digest, bundles)}) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -540,8 +482,10 @@ def package(gh: GitHub, root: Path, artifacts: Path, dist: Path, repo: str, sha:
 def release(entries: list[dict], dist: Path, sha: str) -> None:
     """A GitHub release of each package, at the commit that was built (with `gh`)."""
     for e in entries:
-        files = [str(dist / e["tag"] / f"{e['id']}.{ext}") for ext in ("zip", "mod.json")]
-        cmd = ["gh", "release", "create", e["tag"], *files, "--target", sha,
+        files = [dist / e["tag"] / f"{e['id']}.{ext}" for ext in ("zip", "mod.json")]
+        if not files[1].is_file():
+            raise Error(f"{e['tag']}: no {files[1].name}; the release needs the attestation")
+        cmd = ["gh", "release", "create", e["tag"], *map(str, files), "--target", sha,
                "--title", f"{e['id']} {e['version']}", "--generate-notes"]
         if e["since"]:
             cmd += ["--notes-start-tag", e["since"]]
@@ -584,6 +528,9 @@ def main(argv=None) -> int:
     c.add_argument("--artifacts", type=Path, required=True)
     c.add_argument("--dist", type=Path, required=True)
     c.add_argument("--require", default=" ".join(PLATFORMS))
+    c = sub.add_parser("attach")
+    c.add_argument("--dist", type=Path, required=True)
+    c.add_argument("--bundles", type=Path, required=True)
     c = sub.add_parser("release")
     c.add_argument("--dist", type=Path, required=True)
     c = sub.add_parser("latest-tags")
@@ -600,9 +547,11 @@ def main(argv=None) -> int:
         elif args.command == "build":
             build(args.root, json.loads(args.plan.read_text()), args.out, args.cargo_args.split())
         elif args.command == "package":
-            entries = package(gh, args.root, args.artifacts, args.dist, repo, sha,
-                              args.require.split())
+            entries = package(args.root, args.artifacts, args.dist, args.require.split())
             print(" ".join(e["tag"] for e in entries))
+        elif args.command == "attach":
+            attach(json.loads((args.dist / "plan.json").read_text()), args.dist,
+                   read_bundles(args.bundles))
         elif args.command == "release":
             release(json.loads((args.dist / "plan.json").read_text()), args.dist, sha)
         elif args.command == "latest-tags":

@@ -1,8 +1,8 @@
 name: Propose Weft mods for the index
 description: >-
-  Opens a pull request on the Weft mod index that adds releases of this repository's mods. The
-  index's own tool writes the files, after checking each release; a reviewer of the index then
-  reads the mod's source and merges.
+  Opens a pull request on the Weft mod index that adds `{repo, tag}` entries for releases of this
+  repository's mods. The index's own `add-release` writes them in its format, after checking each
+  release; a reviewer of the index then reads the mod's source and merges.
 inputs:
   token:
     description: >-
@@ -60,7 +60,7 @@ runs:
         python -m weftindex add-release "$GITHUB_REPOSITORY" $tags
         title=$(cat dist/pr-title.txt)
         branch="add/$GITHUB_REPOSITORY/${tags// /+}"
-        git add mods weft.toml
+        git add -A # what add-release wrote; its dist/ is ignored
         git -c user.name="$user" -c user.email="$user@users.noreply.github.com" commit -qm "$title"
         git push -qf "https://x-access-token:$GH_TOKEN@github.com/$push_repo.git" "HEAD:refs/heads/$branch"
 

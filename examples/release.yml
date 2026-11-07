@@ -1,8 +1,8 @@
 # Copy to .github/workflows/release.yml in your mod's repository.
 # On every push to main: a mod whose Cargo.toml version has no release yet is released at that
 # version; a mod that changed since its newest release gets a release candidate,
-# X.Y.(Z+1)-rc.<run>.g<commit>. Each release holds <id>.zip and <id>.mod.json, with attested
-# build provenance.
+# X.Y.(Z+1)-rc.<run>.g<commit>. Each release holds <id>.zip, with its weft-mod.toml, and
+# <id>.mod.json, the zip's build provenance attestation.
 name: Release
 
 on:
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true # if Weft is a submodule
-      - uses: Zorro909/weft-mod-action/build@v1
+      - uses: Zorro909/weft-mod-action/build@v2
         # with:
         #   mods: |          # the mod folders; default: the repository root
         #     cogwork
@@ -46,4 +46,4 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - uses: Zorro909/weft-mod-action/release@v1
+      - uses: Zorro909/weft-mod-action/release@v2
