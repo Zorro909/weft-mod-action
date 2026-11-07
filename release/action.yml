@@ -1,7 +1,7 @@
 name: Release Weft mods
 description: >-
-  Packs each mod the build action built into `<id>.zip` with its `<id>.mod.json`, attests their
-  build provenance, and creates a GitHub release of each. Run it after the build jobs, on a
+  Packs each mod the build action built into `<id>.zip`, attests its build provenance into
+  `<id>.mod.json`, and creates a GitHub release of each. Run it after the build jobs, on a
   checkout of the same commit (with submodules, if Weft is one).
 inputs:
   github-release:
@@ -9,8 +9,8 @@ inputs:
     default: "true"
   attest:
     description: >-
-      Attest the build provenance of each zip. Needs the permissions `id-token: write` and
-      `attestations: write`.
+      Attest the build provenance of each zip, into its `<id>.mod.json`. Needs the permissions
+      `id-token: write` and `attestations: write`. A GitHub release needs it.
     default: "true"
   require-platforms:
     description: The platforms each zip must have a library for, separated by spaces.
@@ -33,7 +33,6 @@ runs:
     - id: package
       shell: bash
       env:
-        GITHUB_TOKEN: ${{ inputs.github-token }}
         REQUIRE: ${{ inputs.require-platforms }}
       run: |
         source "$GITHUB_ACTION_PATH/../python.sh"
@@ -42,10 +41,20 @@ runs:
           --require "$REQUIRE")
         echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
-    - if: steps.package.outputs.tags != '' && inputs.attest == 'true'
+    - id: attest
+      if: steps.package.outputs.tags != '' && inputs.attest == 'true'
       uses: actions/attest-build-provenance@v4
       with:
         subject-path: ${{ runner.temp }}/weft-mod-dist/*/*.zip
+
+    - if: steps.attest.outcome == 'success'
+      shell: bash
+      env:
+        BUNDLES: ${{ steps.attest.outputs.bundle-path }}
+      run: |
+        source "$GITHUB_ACTION_PATH/../python.sh"
+        python "$GITHUB_ACTION_PATH/../weftmod.py" attach --dist "$RUNNER_TEMP/weft-mod-dist" \
+          --bundles "$BUNDLES"
 
     - if: steps.package.outputs.tags != '' && inputs.github-release == 'true'
       shell: bash

@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - id: pr
-        uses: Zorro909/weft-mod-action/index-pr@v1
+        uses: Zorro909/weft-mod-action/index-pr@v2
         with:
           token: ${{ secrets.WEFT_INDEX_TOKEN }}
           tags: ${{ inputs.tags }}
