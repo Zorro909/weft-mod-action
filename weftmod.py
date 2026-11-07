@@ -8,6 +8,7 @@ Python 3.10 or newer, so that it runs on every GitHub runner as it is.
     attach      each zip's `<id>.mod.json`, from its attestation
     release     a GitHub release of each package
     latest-tags the newest release tag of each mod                (index-pr/action.yml)
+    propose     add releases to an index checkout, and update the mods' summaries
 
 A mod is a folder with a Cargo.toml that builds a `cdylib`; its id is that library's name. See
 README.md for the rules.
@@ -37,6 +38,7 @@ CORE_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 _PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER_RE = re.compile(CORE_RE.pattern + rf"(?:-{_PRE_ID}(?:\.{_PRE_ID})*)?$")
 ID_RE = re.compile(r"^[a-z0-9_]+$")
+SUMMARY_MAX = 140  # the index's limit
 
 
 class Error(Exception):
@@ -378,29 +380,59 @@ def weft_abi(folder: Path) -> str:
     return fnv1a64((Path(abi["manifest_path"]).parent / "src" / "lib.rs").read_bytes())
 
 
+def weft_metadata(mod: Mod) -> dict:
+    return (mod.package.get("metadata") or {}).get("weft") or {}
+
+
+def lang(mod: Mod) -> dict[str, str]:
+    path = mod.folder / "assets" / "lang" / "en_us.lang"
+    return parse_lang(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+
+def mod_name(mod: Mod) -> str:
+    return weft_metadata(mod).get("name") or lang(mod).get(f"mod.{mod.id}.name") or mod.id
+
+
+def mod_summary(mod: Mod) -> str:
+    """The summary for the index: `[package.metadata.weft] summary`, else the first sentence of
+    `mod.<id>.description` in the lang file, else `[package] description`, else the name."""
+    description = (weft_metadata(mod).get("summary") or lang(mod).get(f"mod.{mod.id}.description")
+                   or mod.package.get("description") or "")
+    return summarize(description) or mod_name(mod)
+
+
+def summarize(description: str) -> str:
+    """The description's first sentence on one line, without color markup, at most 140 characters:
+    cut at a comma, or else a word, when it is longer."""
+    text = re.sub(r"\{[^{}]*\}", "", description)
+    text = re.split(r"\\n|\n", text)[0].strip()
+    text = " ".join(re.split(r"(?<=[.!?])\s+", text)[0].split())
+    if len(text) <= SUMMARY_MAX:
+        return text
+    cut = text[:SUMMARY_MAX - 1]
+    comma, space = cut.rfind(", "), cut.rfind(" ")
+    end = comma if comma >= SUMMARY_MAX // 2 else space if space > 0 else SUMMARY_MAX - 1
+    return cut[:end].rstrip(" ,;:") + "…"
+
+
 def manifest(root: Path, entry: dict) -> dict:
     """The fields of `weft-mod.toml`: id, name, version, abi and deps."""
     folder = root / entry["folder"]
     mod = Mod(folder)
-    mod_id = entry["id"]
-    weft = (mod.package.get("metadata") or {}).get("weft") or {}
-    lang_file = folder / "assets" / "lang" / "en_us.lang"
-    lang = parse_lang(lang_file.read_text(encoding="utf-8")) if lang_file.is_file() else {}
-    deps = weft.get("deps")
+    deps = weft_metadata(mod).get("deps")
     if deps is None:
-        deps = parse_deps(mod.lib_rs.read_text(encoding="utf-8"), mod_id)
+        deps = parse_deps(mod.lib_rs.read_text(encoding="utf-8"), mod.id)
     if not all(isinstance(d, str) and ID_RE.match(d) for d in deps):
-        raise Error(f"{mod_id}: [package.metadata.weft] deps must be mod ids, not {deps!r}")
-    return {"id": mod_id,
-            "name": weft.get("name") or lang.get(f"mod.{mod_id}.name") or mod_id,
-            "version": entry["version"],
-            "abi": weft_abi(folder),
-            "deps": deps}
+        raise Error(f"{mod.id}: [package.metadata.weft] deps must be mod ids, not {deps!r}")
+    return {"id": mod.id, "name": mod_name(mod), "version": entry["version"],
+            "abi": weft_abi(folder), "deps": deps}
 
 
 def to_toml(fields: dict) -> str:
-    """Strings and lists of strings as TOML: a JSON string is a TOML basic string."""
-    return "".join(f"{k} = {json.dumps(v, ensure_ascii=False)}\n" for k, v in fields.items())
+    """Strings and lists of strings as TOML: a JSON string is a TOML basic string, once a raw DEL
+    is escaped too."""
+    return "".join(f"{k} = {json.dumps(v, ensure_ascii=False)}\n".replace("\x7f", "\\u007f")
+                   for k, v in fields.items())
 
 
 def merge_builds(artifacts: Path, libraries: Path) -> list[dict]:
@@ -509,6 +541,71 @@ def latest_tags(gh: GitHub, repo: str, folders: list[Path]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
+# propose
+
+
+def new_tags(index: Path, tags: list[str], summaries: dict[str, str]) -> list[str]:
+    """The tags the index doesn't have yet. A mod new to the index needs a summary: its folder
+    must be one of the `mods`."""
+    out = []
+    for tag in tags:
+        mod_id, _, version = tag.partition("-v")
+        if (index / "mods" / mod_id / "versions" / f"{version}.toml").is_file():
+            log(f"{tag}: in the index already")
+        elif not (index / "mods" / mod_id / "mod.toml").is_file() and mod_id not in summaries:
+            raise Error(f"{mod_id} is new to the index: list its folder in `mods`, for its summary")
+        else:
+            out.append(tag)
+    return out
+
+
+def set_summaries(index: Path, summaries: dict[str, str]) -> list[str]:
+    """Sets the summary in each mod's `mods/<id>/mod.toml` in the index, keeping its other keys.
+    Returns the ids whose summary changed."""
+    import tomllib  # Python 3.11+, as the index's own tool needs
+    changed = []
+    for mod_id, summary in summaries.items():
+        path = index / "mods" / mod_id / "mod.toml"
+        if not path.is_file():
+            continue
+        meta = tomllib.loads(path.read_text(encoding="utf-8"))
+        if meta.get("summary") != summary:
+            path.write_text(to_toml({**meta, "summary": summary}), encoding="utf-8")
+            changed.append(mod_id)
+    return changed
+
+
+def propose(index: Path, repo: str, folders: list[Path], tags: list[str]) -> tuple[str, str] | None:
+    """Adds the releases the index doesn't have with its own `add-release`, and sets each mod's
+    summary to the one its folder gives now. Returns the pull request's title and body, or None
+    when there is nothing to propose."""
+    summaries = {m.id: mod_summary(m) for m in map(Mod, folders)}
+    indexed = {i for i in summaries if (index / "mods" / i / "mod.toml").is_file()}
+    tags = new_tags(index, tags, summaries)
+    title, body = "", ""
+    if tags:
+        # add-release gives every mod new to the index the one `--summary`; set_summaries then
+        # gives each its own.
+        first_new = next((summaries[t.partition("-v")[0]] for t in tags
+                          if t.partition("-v")[0] not in indexed), None)
+        cmd = [sys.executable, "-m", "weftindex", "add-release", repo, *tags]
+        if subprocess.run(cmd + (["--summary", first_new] if first_new else []),
+                          cwd=index).returncode != 0:
+            raise Error("the index's add-release refused the releases")
+        title = (index / "dist" / "pr-title.txt").read_text(encoding="utf-8").strip()
+        body = (index / "dist" / "pr.md").read_text(encoding="utf-8")
+    updated = [i for i in set_summaries(index, summaries) if i in indexed]
+    if not title and not updated:
+        return None
+    if updated:
+        title = title or "Update the summary of " + ", ".join(updated)
+        body += "\nNew summaries:\n\n" + "".join(f"- {i}: {summaries[i]}\n" for i in updated)
+    if subprocess.run([sys.executable, "-m", "weftindex", "validate"], cwd=index).returncode != 0:
+        raise Error("the index doesn't validate with the new summaries")
+    return title, body.lstrip()
+
+
+# ---------------------------------------------------------------------------------------------
 # CLI
 
 
@@ -535,6 +632,11 @@ def main(argv=None) -> int:
     c.add_argument("--dist", type=Path, required=True)
     c = sub.add_parser("latest-tags")
     c.add_argument("--mods", default=".")
+    c = sub.add_parser("propose")
+    c.add_argument("--index", type=Path, required=True)
+    c.add_argument("--mods", default=".")
+    c.add_argument("--tags", required=True)
+    c.add_argument("--out", type=Path, required=True, help="writes title.txt and body.md here")
     args = p.parse_args(argv)
 
     repo, sha = os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GITHUB_SHA", "")
@@ -556,6 +658,12 @@ def main(argv=None) -> int:
             release(json.loads((args.dist / "plan.json").read_text()), args.dist, sha)
         elif args.command == "latest-tags":
             print(" ".join(latest_tags(gh, repo, mod_folders(args.mods, args.root))))
+        elif args.command == "propose":
+            pr = propose(args.index, repo, mod_folders(args.mods, args.root), args.tags.split())
+            if pr:
+                args.out.mkdir(parents=True, exist_ok=True)
+                (args.out / "title.txt").write_text(pr[0] + "\n", encoding="utf-8")
+                (args.out / "body.md").write_text(pr[1], encoding="utf-8")
     except Error as e:
         print(f"::error::{e}", file=sys.stderr)
         return 1

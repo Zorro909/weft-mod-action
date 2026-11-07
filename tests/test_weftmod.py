@@ -115,6 +115,13 @@ class Metadata(unittest.TestCase):
             with self.assertRaisesRegex(weftmod.Error, r"package\.metadata\.weft"):
                 weftmod.parse_deps(src, "m")
 
+    def test_summary(self):
+        self.assertEqual(weftmod.summarize("{gold}Gears{/} and belts. More later.\\nNext line"),
+                         "Gears and belts.")
+        s = weftmod.summarize("word " * 60)
+        self.assertLessEqual(len(s), weftmod.SUMMARY_MAX)
+        self.assertTrue(s.endswith("…"))
+
     def test_lang(self):
         self.assertEqual(weftmod.parse_lang("# c\na.b = x = y\n\nbad\n"), {"a.b": "x = y"})
 
@@ -126,6 +133,9 @@ class Metadata(unittest.TestCase):
 class Toml(unittest.TestCase):
     FIELDS = {"id": "m", "name": 'A "quoted" mod\n', "version": "0.1.1-rc.4.gabcdef0",
               "abi": "f470b1cbb1f9ad91", "deps": ["base", "cogwork"]}
+
+    def test_a_raw_del_is_escaped(self):
+        self.assertEqual(weftmod.to_toml({"name": "a\x7fb"}), 'name = "a\\u007fb"\n')
 
     def test_weft_mod_toml(self):
         self.assertEqual(weftmod.to_toml(self.FIELDS),
@@ -280,6 +290,90 @@ class MergeBuilds(TempDir):
         self.build("windows", [{"id": "m", "tag": "m-v1.0.1-rc.1.gabcdef0"}], [])
         with self.assertRaisesRegex(weftmod.Error, "planned different releases"):
             weftmod.merge_builds(self.tmp / "artifacts", self.tmp / "out")
+
+
+def index_with(root: Path, mods: dict[str, tuple[str, list[str]]]) -> Path:
+    """An index checkout: `mods` maps an id to the text of its mod.toml and its versions."""
+    for mod_id, (meta, versions) in mods.items():
+        (root / "mods" / mod_id / "versions").mkdir(parents=True)
+        (root / "mods" / mod_id / "mod.toml").write_text(meta)
+        for v in versions:
+            (root / "mods" / mod_id / "versions" / f"{v}.toml").write_text("")
+    return root
+
+
+class Summaries(TempDir):
+    def test_new_tags(self):
+        index = index_with(self.tmp, {"a": ('summary = "A"\n', ["1.0.0"])})
+        self.assertEqual(weftmod.new_tags(index, ["a-v1.0.0", "a-v1.1.0", "b-v0.1.0"], {"b": "B"}),
+                         ["a-v1.1.0", "b-v0.1.0"])
+        with self.assertRaisesRegex(weftmod.Error, "c is new to the index"):
+            weftmod.new_tags(index, ["c-v1.0.0"], {})
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib is Python 3.11+")
+    def test_set_summaries_keeps_the_other_keys(self):
+        index = index_with(self.tmp, {"a": ('summary = "Old"\nname = "A"\n', ["1.0.0"])})
+        self.assertEqual(weftmod.set_summaries(index, {"a": "New", "b": "Not indexed"}), ["a"])
+        self.assertEqual((index / "mods/a/mod.toml").read_text(), 'summary = "New"\nname = "A"\n')
+        self.assertEqual(weftmod.set_summaries(index, {"a": "New"}), [])
+
+
+# Stands in for the index's tool: add-release writes what the real one would, and records its
+# arguments; validate passes.
+FAKE_WEFTINDEX = """
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+calls = Path("calls.json")
+calls.write_text(json.dumps((json.loads(calls.read_text()) if calls.exists() else []) + [args]))
+if args[0] == "add-release":
+    end = args.index("--summary") if "--summary" in args else len(args)
+    for tag in args[2:end]:
+        mod_id, _, version = tag.partition("-v")
+        (Path("mods") / mod_id / "versions").mkdir(parents=True, exist_ok=True)
+        (Path("mods") / mod_id / "versions" / f"{version}.toml").write_text("")
+        if not (Path("mods") / mod_id / "mod.toml").exists():
+            (Path("mods") / mod_id / "mod.toml").write_text(f"summary = {json.dumps(args[end + 1])}\\n")
+    Path("dist").mkdir(exist_ok=True)
+    Path("dist/pr-title.txt").write_text("Add " + " ".join(args[2:end]))
+    Path("dist/pr.md").write_text("checked")
+"""
+
+
+@unittest.skipUnless(shutil.which("cargo"), "needs cargo")
+@unittest.skipIf(sys.version_info < (3, 11), "tomllib is Python 3.11+")
+class Propose(TempDir):
+    def index(self, mods):
+        index = index_with(self.tmp, mods)
+        (index / "weftindex").mkdir()
+        (index / "weftindex" / "__main__.py").write_text(FAKE_WEFTINDEX)
+        return index
+
+    def propose(self, index, tags):
+        return weftmod.propose(index, "someone/mods", [FIXTURE], tags)
+
+    def calls(self, index):
+        return json.loads((index / "calls.json").read_text())
+
+    def test_a_new_mod_gets_its_summary(self):
+        index = self.index({})
+        title, body = self.propose(index, ["hello_weft-v0.1.0"])
+        self.assertEqual(title, "Add hello_weft-v0.1.0")
+        self.assertEqual(self.calls(index)[0], ["add-release", "someone/mods", "hello_weft-v0.1.0",
+                                                "--summary", "A mod that does nothing."])
+        self.assertEqual((index / "mods/hello_weft/mod.toml").read_text(),
+                         'summary = "A mod that does nothing."\n')
+
+    def test_a_changed_summary_alone_is_proposed(self):
+        index = self.index({"hello_weft": ('summary = "Old"\n', ["0.1.0"])})
+        title, body = self.propose(index, ["hello_weft-v0.1.0"])
+        self.assertEqual(title, "Update the summary of hello_weft")
+        self.assertIn("- hello_weft: A mod that does nothing.", body)
+        self.assertEqual(self.calls(index), [["validate"]])  # no add-release
+
+    def test_nothing_new_proposes_nothing(self):
+        index = self.index({"hello_weft": ('summary = "A mod that does nothing."\n', ["0.1.0"])})
+        self.assertIsNone(self.propose(index, ["hello_weft-v0.1.0"]))
 
 
 if __name__ == "__main__":
