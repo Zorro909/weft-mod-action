@@ -479,7 +479,7 @@ def git(cwd: Path, *args: str) -> str:
 SDK_GIT = "https://github.com/Weft-Rust/Weft"
 SDK_HINT = f'weft_sdk = {{ git = "{SDK_GIT}", tag = "<a Weft release, such as v26.11.3>" }}'
 GAME_MODS = {"base", "core"}  # ship with the game; the index's `deps` leave them out
-PR_BODY = "Submitted with weft-mod-action, which writes the file as `weft --submit-mod` does."
+PR_BODY = "Submitted with weft-mod-action"
 
 
 # The line the index's scripts/patch_sdk.py sets to the Weft it builds against, which it needs
@@ -522,16 +522,6 @@ def index_file(mod_id: str, summary: str, owner: str, repo: str, folder: str, co
         f"owner = {s(owner)}\n"
         "# Set by a maintainer who read the source of this commit.\n"
         'reviewed = ""\n')
-
-
-def check_builds(mod: Mod, tag: str) -> None:
-    """`cargo build --release` in the mod's folder, as weft does: what doesn't build here wouldn't
-    on the index either. Its output goes to the log, not to the URLs this prints."""
-    log(f"::group::cargo build --release in {mod.folder} ({tag})")
-    r = subprocess.run(["cargo", "build", "--release"], cwd=mod.folder, stdout=sys.stderr)
-    log("::endgroup::")
-    if r.returncode != 0:
-        raise Error(f"{tag}: it doesn't build here, so it wouldn't on the index either")
 
 
 def index_fork(gh: GitHub, login: str, tries: int = 60) -> tuple[str, str]:
@@ -590,12 +580,13 @@ def propose(gh: GitHub, fork: str, base: str, path: str, text: str, mod_id: str,
 def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str],
            dry_run: bool = False) -> list[str]:
     """Proposes each release to the index as `weft --submit-mod` does, from `clone` (a clone of
-    the mod's repository) at the release's commit: checks the mod, builds it once, writes
+    the mod's repository) at the release's commit: checks the mod, writes
     `mods/<id>/<version>.toml` and opens a pull request that adds it, from the token's fork of the
-    index. The index builds that commit at the version in its Cargo.toml, so the tag must have that
-    version: a full release, not a release candidate. Leaves out releases the index has, and those
-    with an open pull request. A dry run opens nothing: it prints each file. Returns the pull
-    requests."""
+    index. Each tag must have a GitHub release, which the release action makes once the mod built
+    on every system: it isn't built again here. The index builds that commit at the version in its
+    Cargo.toml, so the tag must have that version: a full release, not a release candidate. Leaves
+    out releases the index has, and those with an open pull request. A dry run opens nothing: it
+    prints each file. Returns the pull requests."""
     try:
         user = gh.api("/user")
     except Error:  # e.g. a GITHUB_TOKEN, which is no one's
@@ -620,10 +611,14 @@ def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str],
                 log(f"{tag}: proposed already, {open_prs[0]['html_url']}")
                 urls.append(open_prs[0]["html_url"])
                 continue
+        rel = gh.api(f"/repos/{repo}/releases/tags/{tag}")
+        if rel is None or rel.get("draft"):
+            raise Error(f"{tag}: {repo} has no release of it. Propose a tag once the release "
+                        f"action (or another) has built it and made its GitHub release")
         commit = (gh.api(f"/repos/{repo}/commits/{tag}") or {}).get("sha")
         if not commit:
             raise Error(f"{tag}: {repo} has no such tag")
-        # A build for the tag before may have left a Cargo.lock: the index builds the commit.
+        # Exactly the commit the index builds, whatever the checkout held before.
         git(clone, "checkout", "-q", "--force", "--detach", commit)
         git(clone, "clean", "-q", "-fd")
         mod = next((m for m in submit_mods(spec, clone) if m.id == mod_id), None)
@@ -646,8 +641,6 @@ def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str],
         text = index_file(mod.id, mod.package.get("description") or "", login or repo.split("/")[0],
                           f"https://github.com/{repo}", "" if folder == "." else folder, commit,
                           weft, deps)
-        log(f"{tag}: building {mod.id} {version} against Weft {weft} to be sure it does")
-        check_builds(mod, tag)
         if dry_run:
             log(f"{tag}: would propose {path}:\n{text}")
             continue

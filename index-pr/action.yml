@@ -13,14 +13,12 @@ inputs:
   tags:
     description: >-
       The release tags to propose, separated by spaces. Default, the newest full release of each
-      mod. Each must be a full release: the index builds the version in Cargo.toml.
+      mod. Each must have a GitHub release, as the release action makes, and be a full release: the
+      index builds the version in Cargo.toml.
     default: ""
   mods:
     description: The mod folders, one per line, relative to the repository root.
     default: "."
-  rust-toolchain:
-    description: The Rust toolchain to install, for the test build of each mod; empty to use the runner's.
-    default: stable
   dry-run:
     description: Run everything, but only print each file instead of opening the pull requests.
     default: "false"
@@ -35,11 +33,6 @@ runs:
       shell: bash
       run: echo "::error::index-pr runs on Linux, such as ubuntu-latest" && exit 1
 
-    - if: inputs.rust-toolchain != ''
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ inputs.rust-toolchain }}
-
     - id: submit
       shell: bash
       env:
@@ -50,8 +43,8 @@ runs:
       run: |
         set -euo pipefail
         source "$GITHUB_ACTION_PATH/../python.sh"
-        # Each release is built and proposed from a clean checkout of its tag's commit: a clone of
-        # its own, so the workflow's checkout needn't be one.
+        # Each release is read from a clean checkout of its tag's commit: a clone of its own, so the
+        # workflow's checkout needn't be one. cargo (for `cargo metadata`) is the runner's.
         clone="$RUNNER_TEMP/weft-mod-source/repo"
         rm -rf "$clone"
         git clone -q --filter=blob:none "https://github.com/$GITHUB_REPOSITORY.git" "$clone"

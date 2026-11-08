@@ -344,6 +344,7 @@ class Submit(TempDir):
         self.responses = {
             "/user": {"login": "someone", "id": 5},
             f"/repos/{self.REPO}/commits/{self.TAG}": {"sha": self.commit},
+            f"/repos/{self.REPO}/releases/tags/{self.TAG}": {"draft": False},
             self.INDEX: {"default_branch": "main"},
             f"{self.INDEX}/git/ref/heads/main": {"object": {"sha": self.MAIN}},
             # The fork from before.
@@ -367,20 +368,12 @@ class Submit(TempDir):
         self.commit = self.head()
         self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.commit}
 
-    def submit(self, tags=(TAG,), dry_run=False, builds=True):
-        """Runs submit; returns its URLs. Leaves the GitHub calls in self.calls and self.sent, and
-        the commits built, with their Cargo.toml, in self.built."""
+    def submit(self, tags=(TAG,), dry_run=False):
+        """Runs submit; returns its URLs. Leaves the GitHub calls in self.calls and self.sent."""
         gh = FakeGitHub(self.responses)
-        self.built = []
-
-        def check_builds(mod, tag):
-            self.built.append((mod.folder, self.head(), mod.version))
-            if not builds:
-                raise weftmod.Error(f"{tag}: it doesn't build here")
-
         try:
-            with mock.patch.object(weftmod, "check_builds", check_builds), \
-                    mock.patch.object(weftmod.time, "sleep") as self.sleep:
+            with mock.patch.object(weftmod.time, "sleep") as self.sleep, \
+                    mock.patch.object(weftmod.subprocess, "run", wraps=subprocess.run) as self.run:
                 return weftmod.submit(gh, self.clone, self.REPO, "hello", list(tags), dry_run)
         finally:
             self.calls, self.sent = gh.calls, dict(gh.sent)
@@ -390,7 +383,9 @@ class Submit(TempDir):
 
     def test_proposes_the_file_from_the_fork(self):
         self.assertEqual(self.submit(), ["https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"])
-        self.assertEqual(self.built, [(self.clone / "hello", self.commit, "0.1.0")])
+        self.assertEqual(self.head(), self.commit)
+        # The release built it already: nothing is built here.
+        self.assertFalse([c for c in self.run.call_args_list if c.args[0][:2] == ["cargo", "build"]])
         self.assertEqual(self.writes(), [
             f"POST {self.FORK}/merge-upstream",
             f"POST {self.FORK}/git/refs",
@@ -405,6 +400,7 @@ class Submit(TempDir):
         pr = self.sent[f"POST {self.INDEX}/pulls"]
         self.assertEqual((pr["title"], pr["head"], pr["base"]),
                          ("hello_weft 0.1.0", f"someone:{self.BRANCH}", "main"))
+        self.assertEqual(pr["body"], "Submitted with weft-mod-action")
 
     def test_the_declared_deps_are_in_the_file(self):
         self.declare_deps(["base", "cogwork"])
@@ -445,11 +441,10 @@ class Submit(TempDir):
                          {"sha": self.MAIN, "force": True})
         self.assertNotIn(f"POST {self.FORK}/git/refs", self.calls)
 
-    def test_a_dry_run_builds_and_shows_the_file_but_writes_nothing(self):
+    def test_a_dry_run_shows_the_file_but_writes_nothing(self):
         self.declare_deps(["base", "cogwork"])
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(self.submit(dry_run=True), [])
-        self.assertEqual(len(self.built), 1)
         self.assertEqual(self.writes(), [])
         self.assertIn(f"would propose {self.PATH}:\n", err.getvalue())
         self.assertIn('deps = ["cogwork"]', err.getvalue())
@@ -459,6 +454,7 @@ class Submit(TempDir):
         self.responses["/user"] = weftmod.Error("HTTP 403 Forbidden")
         self.REPO = "theirs/mods"
         self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.commit}
+        self.responses[f"/repos/{self.REPO}/releases/tags/{self.TAG}"] = {"draft": False}
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.submit(dry_run=True)
         self.assertIn('\nauthor = "theirs"\n', err.getvalue())
@@ -471,18 +467,20 @@ class Submit(TempDir):
     def test_what_the_index_has_or_is_proposed_is_left_out(self):
         self.responses[f"{self.INDEX}/contents/{self.PATH}"] = {"type": "file"}
         self.assertEqual(self.submit(), [])
-        self.assertEqual((self.built, self.writes()), ([], []))
+        self.assertEqual(self.writes(), [])
         del self.responses[f"{self.INDEX}/contents/{self.PATH}"]
         url = "https://github.com/Weft-Rust/Weft-Mods-Index/pull/3"
         self.responses[f"{self.INDEX}/pulls?state=open&head=someone:{self.BRANCH}"] = [
             {"html_url": url}]
         self.assertEqual(self.submit(), [url])
-        self.assertEqual((self.built, self.writes()), ([], []))
-
-    def test_what_doesnt_build_isnt_proposed(self):
-        with self.assertRaisesRegex(weftmod.Error, "doesn't build"):
-            self.submit(builds=False)
         self.assertEqual(self.writes(), [])
+
+    def test_a_tag_without_a_release_is_refused(self):
+        for release in (None, {"draft": True}):
+            self.responses[f"/repos/{self.REPO}/releases/tags/{self.TAG}"] = release
+            with self.assertRaisesRegex(weftmod.Error, "has no release of it"):
+                self.submit()
+            self.assertEqual(self.writes(), [])
 
     def test_weft_sdk_must_be_a_weft_release(self):
         cargo = self.clone / "hello" / "Cargo.toml"
@@ -492,10 +490,10 @@ class Submit(TempDir):
         self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.head()}
         with self.assertRaisesRegex(weftmod.Error, "weft_sdk must come from"):
             self.submit()
-        self.assertEqual(self.built, [])
+        self.assertEqual(self.writes(), [])
 
-    def test_a_build_before_leaves_no_dirt(self):
-        # The tag before built here: cargo rewrote Cargo.lock, or wrote an untracked one.
+    def test_a_dirty_checkout_is_cleaned(self):
+        # Cargo.lock rewritten, and an untracked file: the file must be of the tagged commit.
         (self.clone / "hello" / "Cargo.lock").write_text("# rewritten\n")
         (self.clone / "hello" / "stray.lock").write_text("# untracked\n")
         self.assertEqual(len(self.submit()), 1)
@@ -505,6 +503,7 @@ class Submit(TempDir):
     def test_a_release_candidate_is_refused(self):
         tag = "hello_weft-v0.1.1-rc.4.gabcdef0"
         self.responses[f"/repos/{self.REPO}/commits/{tag}"] = {"sha": self.commit}
+        self.responses[f"/repos/{self.REPO}/releases/tags/{tag}"] = {"prerelease": True}
         with self.assertRaisesRegex(weftmod.Error, "Cargo.toml says version 0.1.0"):
             self.submit([tag])
 
@@ -525,10 +524,10 @@ class Submit(TempDir):
         subprocess.run(["git", "-C", str(self.clone), "-c", "user.name=t", "-c", "user.email=t@t",
                         "commit", "-qam", "v"], check=True)
         self.responses[f"/repos/{self.REPO}/commits/hello_weft-v0.2.0"] = {"sha": self.head()}
+        self.responses[f"/repos/{self.REPO}/releases/tags/hello_weft-v0.2.0"] = {"draft": False}
         self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.commit}
-        self.submit([self.TAG, "hello_weft-v0.2.0"])
+        self.assertEqual(len(self.submit([self.TAG, "hello_weft-v0.2.0"])), 2)
         self.assertEqual(self.calls.count(self.FORK), 1)
-        self.assertEqual([b[2] for b in self.built], ["0.1.0", "0.2.0"])
         self.assertIn(f"PUT {self.FORK}/contents/mods/hello_weft/0.2.0.toml", self.calls)
 
 

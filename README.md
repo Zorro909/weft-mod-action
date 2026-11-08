@@ -164,9 +164,9 @@ For each tag, `index-pr`:
 
 1. leaves it out when the index has that version, or when the token's account has an open pull
    request for it;
-2. clones your repository and checks out the tag's commit;
-3. checks the mod as above, and builds it once with `cargo build --release`: what doesn't build
-   there wouldn't on the index either;
+2. requires a GitHub release of the tag, as `release` makes once the mod has built on every
+   system (or any other release of it). So it builds nothing itself: run it after `release`;
+3. clones your repository, checks out the tag's commit and checks the mod as above;
 4. writes `mods/<id>/<version>.toml` as `weft --submit-mod` would;
 5. forks the index to the token's account, or reuses the fork it has, and opens the pull request
    `<id> <version>` from the branch `<id>-<version>` of the fork, which holds just that file. A
@@ -179,11 +179,10 @@ It does it all with GitHub's API, without the `weft` binary.
 | `token` | | The token. |
 | `tags` | the newest full release of each mod | Release tags, separated by spaces. |
 | `mods` | `.` | The mod folders. |
-| `rust-toolchain` | `stable` | The toolchain for the test build; empty to use the runner's. |
 | `dry-run` | `false` | Do everything but write to GitHub: print each file, open no pull request. |
 
 Its output `urls` is the pull requests, separated by spaces, with those that were open already. It
-runs on Linux.
+runs on Linux, and reads each mod with the runner's `cargo metadata`.
 
 The file, like weft's, has `name`, the mod id; `summary`, `[package] description`; `author` and
 `owner`, the token's account; `repo`, `dir` and `commit`, where to build; and `weft`, the tag of
