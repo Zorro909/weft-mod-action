@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
-import hashlib
+import contextlib
+import io
 import json
 import shutil
+import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -48,9 +51,12 @@ class FakeGitHub:
     def __init__(self, responses: dict | None = None):
         self.responses = responses or {}
         self.calls: list[str] = []
+        self.sent: list[tuple[str, dict]] = []
 
-    def api(self, path):
-        self.calls.append(path)
+    def api(self, path, method="GET", data=None):
+        self.calls.append(path if method == "GET" else f"{method} {path}")
+        if data is not None:
+            self.sent.append((f"{method} {path}", data))
         return self.responses.get(path)
 
     def pages(self, path):
@@ -115,68 +121,13 @@ class Metadata(unittest.TestCase):
             with self.assertRaisesRegex(weftmod.Error, r"package\.metadata\.weft"):
                 weftmod.parse_deps(src, "m")
 
-    def test_summary(self):
-        self.assertEqual(weftmod.summarize("{gold}Gears{/} and belts. More later.\\nNext line"),
-                         "Gears and belts.")
-        s = weftmod.summarize("word " * 60)
-        self.assertLessEqual(len(s), weftmod.SUMMARY_MAX)
-        self.assertTrue(s.endswith("…"))
-
-    def test_lang(self):
-        self.assertEqual(weftmod.parse_lang("# c\na.b = x = y\n\nbad\n"), {"a.b": "x = y"})
-
-    def test_fnv(self):
-        self.assertEqual(weftmod.fnv1a64(b""), "cbf29ce484222325")
-        self.assertEqual(weftmod.fnv1a64(b"a"), "af63dc4c8601ec8c")
-
-
-class Toml(unittest.TestCase):
-    FIELDS = {"id": "m", "name": 'A "quoted" mod\n', "version": "0.1.1-rc.4.gabcdef0",
-              "abi": "f470b1cbb1f9ad91", "deps": ["base", "cogwork"]}
-
-    def test_a_raw_del_is_escaped(self):
-        self.assertEqual(weftmod.to_toml({"name": "a\x7fb"}), 'name = "a\\u007fb"\n')
-
-    def test_weft_mod_toml(self):
-        self.assertEqual(weftmod.to_toml(self.FIELDS),
-                         'id = "m"\nname = "A \\"quoted\\" mod\\n"\n'
-                         'version = "0.1.1-rc.4.gabcdef0"\nabi = "f470b1cbb1f9ad91"\n'
-                         'deps = ["base", "cogwork"]\n')
-
-    @unittest.skipIf(sys.version_info < (3, 11), "tomllib is Python 3.11+")
-    def test_reads_back_as_toml(self):
-        import tomllib
-        self.assertEqual(tomllib.loads(weftmod.to_toml(self.FIELDS)), self.FIELDS)
-
-
-def bundle(*digests: str) -> dict:
-    statement = {"_type": "https://in-toto.io/Statement/v1",
-                 "subject": [{"name": "x.zip", "digest": {"sha256": d}} for d in digests]}
-    return {"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
-            "dsseEnvelope": {"payload": base64.b64encode(json.dumps(statement).encode()).decode(),
-                             "payloadType": "application/vnd.in-toto+json"}}
-
-
-class Attach(TempDir):
-    def test_each_zip_gets_the_bundle_that_names_it(self):
-        entries = []
-        for mod_id in ("a", "b"):
-            (self.tmp / f"{mod_id}-v1.0.0").mkdir()
-            (self.tmp / f"{mod_id}-v1.0.0" / f"{mod_id}.zip").write_bytes(mod_id.encode())
-            entries.append({"id": mod_id, "tag": f"{mod_id}-v1.0.0"})
-        a, b = (hashlib.sha256(x).hexdigest() for x in (b"a", b"b"))
-        lines = self.tmp / "attestation.jsonl"
-        lines.write_text(json.dumps(bundle("0" * 64)) + "\n" + json.dumps(bundle(b, a)) + "\n")
-        weftmod.attach(entries, self.tmp, weftmod.read_bundles(lines))
-        for mod_id in ("a", "b"):
-            info = json.loads((self.tmp / f"{mod_id}-v1.0.0" / f"{mod_id}.mod.json").read_text())
-            self.assertEqual(info, {"attestation": bundle(b, a)})
-
-    def test_a_zip_without_a_bundle_fails(self):
-        one = self.tmp / "bundle.json"
-        one.write_text(json.dumps(bundle("0" * 64), indent=2))
-        with self.assertRaisesRegex(weftmod.Error, "no attestation"):
-            weftmod.bundle_for("1" * 64, weftmod.read_bundles(one))
+    def test_with_deps(self):
+        text = 'name = "m"\n# Mod ids it needs besides base.\ndeps = []\nowner = "o"\n'
+        self.assertEqual(weftmod.with_deps(text, ["cogwork", "a_b"]),
+                         'name = "m"\n# Mod ids it needs besides base.\n'
+                         'deps = ["cogwork", "a_b"]\nowner = "o"\n')
+        self.assertEqual(weftmod.with_deps(text, []), text)
+        self.assertIsNone(weftmod.with_deps('name = "m"\n', ["a"]))
 
 
 class Folders(TempDir):
@@ -249,24 +200,23 @@ class Pack(TempDir):
     def test_platforms_and_layout(self):
         libs, assets = self.libraries()
         out = self.tmp / "m.zip"
-        self.assertEqual(weftmod.pack('id = "m"\n', libs, assets, out),
+        self.assertEqual(weftmod.pack(libs, assets, out),
                          ["windows-x64", "linux-x64", "macos-arm64"])
         with zipfile.ZipFile(out) as z:
-            self.assertEqual(z.namelist(), ["weft-mod.toml", "libm.dylib", "libm.so", "m.dll",
+            self.assertEqual(z.namelist(), ["libm.dylib", "libm.so", "m.dll",
                                             "assets/lang/en_us.lang"])
-            self.assertEqual(z.read("weft-mod.toml"), b'id = "m"\n')
 
     def test_same_input_same_bytes(self):
         libs, assets = self.libraries()
-        weftmod.pack("", libs, assets, self.tmp / "a.zip")
-        weftmod.pack("", libs, assets, self.tmp / "b.zip")
+        weftmod.pack(libs, assets, self.tmp / "a.zip")
+        weftmod.pack(libs, assets, self.tmp / "b.zip")
         self.assertEqual((self.tmp / "a.zip").read_bytes(), (self.tmp / "b.zip").read_bytes())
 
     def test_a_library_must_match_its_name(self):
         libs, assets = self.libraries()
         (libs / "libm.so").write_bytes(pe())
         with self.assertRaisesRegex(weftmod.Error, "libm.so is not a library"):
-            weftmod.pack("", libs, assets, self.tmp / "m.zip")
+            weftmod.pack(libs, assets, self.tmp / "m.zip")
 
 
 class MergeBuilds(TempDir):
@@ -292,88 +242,150 @@ class MergeBuilds(TempDir):
             weftmod.merge_builds(self.tmp / "artifacts", self.tmp / "out")
 
 
-def index_with(root: Path, mods: dict[str, tuple[str, list[str]]]) -> Path:
-    """An index checkout: `mods` maps an id to the text of its mod.toml and its versions."""
-    for mod_id, (meta, versions) in mods.items():
-        (root / "mods" / mod_id / "versions").mkdir(parents=True)
-        (root / "mods" / mod_id / "mod.toml").write_text(meta)
-        for v in versions:
-            (root / "mods" / mod_id / "versions" / f"{v}.toml").write_text("")
-    return root
-
-
-class Summaries(TempDir):
-    def test_new_tags(self):
-        index = index_with(self.tmp, {"a": ('summary = "A"\n', ["1.0.0"])})
-        self.assertEqual(weftmod.new_tags(index, ["a-v1.0.0", "a-v1.1.0", "b-v0.1.0"], {"b": "B"}),
-                         ["a-v1.1.0", "b-v0.1.0"])
-        with self.assertRaisesRegex(weftmod.Error, "c is new to the index"):
-            weftmod.new_tags(index, ["c-v1.0.0"], {})
-
-    @unittest.skipIf(sys.version_info < (3, 11), "tomllib is Python 3.11+")
-    def test_set_summaries_keeps_the_other_keys(self):
-        index = index_with(self.tmp, {"a": ('summary = "Old"\nname = "A"\n', ["1.0.0"])})
-        self.assertEqual(weftmod.set_summaries(index, {"a": "New", "b": "Not indexed"}), ["a"])
-        self.assertEqual((index / "mods/a/mod.toml").read_text(), 'summary = "New"\nname = "A"\n')
-        self.assertEqual(weftmod.set_summaries(index, {"a": "New"}), [])
-
-
-# Stands in for the index's tool: add-release writes what the real one would, and records its
-# arguments; validate passes.
-FAKE_WEFTINDEX = """
-import json, sys
-from pathlib import Path
-args = sys.argv[1:]
-calls = Path("calls.json")
-calls.write_text(json.dumps((json.loads(calls.read_text()) if calls.exists() else []) + [args]))
-if args[0] == "add-release":
-    end = args.index("--summary") if "--summary" in args else len(args)
-    for tag in args[2:end]:
-        mod_id, _, version = tag.partition("-v")
-        (Path("mods") / mod_id / "versions").mkdir(parents=True, exist_ok=True)
-        (Path("mods") / mod_id / "versions" / f"{version}.toml").write_text("")
-        if not (Path("mods") / mod_id / "mod.toml").exists():
-            (Path("mods") / mod_id / "mod.toml").write_text(f"summary = {json.dumps(args[end + 1])}\\n")
-    Path("dist").mkdir(exist_ok=True)
-    Path("dist/pr-title.txt").write_text("Add " + " ".join(args[2:end]))
-    Path("dist/pr.md").write_text("checked")
+# Stands in for `weft --submit-mod`: refuses a dirty checkout as weft does, records how it was
+# run, and prints what weft prints.
+FAKE_WEFT = """#!/bin/sh
+if [ -n "$(git status --porcelain)" ]; then echo "commit your changes first"; exit 1; fi
+echo "$PWD $* gh=${GH_TOKEN:-none} helper=${GIT_CONFIG_VALUE_1:-none}" >> "$(dirname "$0")/calls"
+if [ -n "$GH_TOKEN" ]; then
+  echo "pull request opened: https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"
+else
+  echo "GitHub opened in the browser: fill in its name and summary if you like."
+  echo "https://github.com/Weft-Rust/Weft-Mods-Index/new/main?filename=mods/hello_weft/0.1.0.toml&value=name%20%3D%20%22hello_weft%22%0Adeps%20%3D%20%5B%5D%0A"
+fi
 """
 
 
-@unittest.skipUnless(shutil.which("cargo"), "needs cargo")
-@unittest.skipIf(sys.version_info < (3, 11), "tomllib is Python 3.11+")
-class Propose(TempDir):
-    def index(self, mods):
-        index = index_with(self.tmp, mods)
-        (index / "weftindex").mkdir()
-        (index / "weftindex" / "__main__.py").write_text(FAKE_WEFTINDEX)
-        return index
+@unittest.skipUnless(shutil.which("cargo") and shutil.which("git"), "needs cargo and git")
+class Submit(TempDir):
+    REPO = "someone/mods"
+    TAG = "hello_weft-v0.1.0"
+    INDEX = "/repos/Weft-Rust/Weft-Mods-Index"
+    FORK_FILE = "/repos/someone/Weft-Mods-Index/contents/mods/hello_weft/0.1.0.toml"
 
-    def propose(self, index, tags):
-        return weftmod.propose(index, "someone/mods", [FIXTURE], tags)
+    def setUp(self):
+        super().setUp()
+        self.clone = self.tmp / "clone"
+        shutil.copytree(FIXTURE, self.clone / "hello")
+        git = ["git", "-C", str(self.clone)]
+        subprocess.run(git[:1] + ["init", "-q", str(self.clone)], check=True)
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"],
+                       check=True)
+        self.commit = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True,
+                                     check=True).stdout.strip()
+        self.weft = self.tmp / "bin" / "weft"
+        self.weft.parent.mkdir()
+        self.weft.write_text(FAKE_WEFT)
+        self.weft.chmod(0o755)
+        self.responses = {"/user": {"login": "someone", "id": 5},
+                          f"/repos/{self.REPO}/commits/{self.TAG}": {"sha": self.commit},
+                          f"{self.INDEX}/pulls/7": {"head": {
+                              "repo": {"full_name": "someone/Weft-Mods-Index"},
+                              "ref": "hello_weft-0.1.0"}},
+                          f"{self.FORK_FILE}?ref=hello_weft-0.1.0": {
+                              "sha": "blob1", "content": base64.b64encode(
+                                  b'name = "hello_weft"\ndeps = []\nowner = "someone"\n').decode()}}
 
-    def calls(self, index):
-        return json.loads((index / "calls.json").read_text())
+    def declare_deps(self, deps):
+        """A new commit of the mod, which declares these deps, for the tag."""
+        cargo = self.clone / "hello" / "Cargo.toml"
+        cargo.write_text(cargo.read_text().replace(
+            "[lib]", f"[package.metadata.weft]\ndeps = {json.dumps(deps)}\n\n[lib]"))
+        git = ["git", "-C", str(self.clone)]
+        subprocess.run(git + ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "d"],
+                       check=True)
+        self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": subprocess.run(
+            git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()}
 
-    def test_a_new_mod_gets_its_summary(self):
-        index = self.index({})
-        title, body = self.propose(index, ["hello_weft-v0.1.0"])
-        self.assertEqual(title, "Add hello_weft-v0.1.0")
-        self.assertEqual(self.calls(index)[0], ["add-release", "someone/mods", "hello_weft-v0.1.0",
-                                                "--summary", "A mod that does nothing."])
-        self.assertEqual((index / "mods/hello_weft/mod.toml").read_text(),
-                         'summary = "A mod that does nothing."\n')
+    def submit(self, tags=(TAG,), dry_run=False, env=None):
+        gh = FakeGitHub(self.responses)
+        old = dict(os.environ)
+        os.environ.update(env if env is not None else {"GH_TOKEN": "tok"})
+        try:
+            urls = weftmod.submit(gh, self.clone, self.REPO, "hello", list(tags), str(self.weft),
+                                  dry_run)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+        calls = (self.weft.parent / "calls").read_text().splitlines() \
+            if (self.weft.parent / "calls").exists() else []
+        self.sent = gh.sent
+        return urls, calls, gh.calls
 
-    def test_a_changed_summary_alone_is_proposed(self):
-        index = self.index({"hello_weft": ('summary = "Old"\n', ["0.1.0"])})
-        title, body = self.propose(index, ["hello_weft-v0.1.0"])
-        self.assertEqual(title, "Update the summary of hello_weft")
-        self.assertIn("- hello_weft: A mod that does nothing.", body)
-        self.assertEqual(self.calls(index), [["validate"]])  # no add-release
+    def test_runs_weft_in_the_mod_folder_at_the_tagged_commit(self):
+        urls, calls, _ = self.submit()
+        self.assertEqual(urls, ["https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"])
+        folder = self.clone / "hello"
+        self.assertEqual(calls, [f"{folder} --submit-mod {folder} gh=tok "
+                                 f"helper=!gh auth git-credential"])
 
-    def test_nothing_new_proposes_nothing(self):
-        index = self.index({"hello_weft": ('summary = "A mod that does nothing."\n', ["0.1.0"])})
-        self.assertIsNone(self.propose(index, ["hello_weft-v0.1.0"]))
+    def test_only_base_needs_no_commit(self):
+        self.submit()  # the fixture's declare_mod! has deps: ["base"]
+        self.assertEqual(self.sent, [])
+
+    def test_the_declared_deps_are_set_in_the_pull_request(self):
+        self.declare_deps(["base", "cogwork"])
+        self.submit()
+        [(call, data)] = self.sent
+        self.assertEqual(call, f"PUT {self.FORK_FILE}")
+        self.assertEqual((data["branch"], data["sha"]), ("hello_weft-0.1.0", "blob1"))
+        self.assertEqual(base64.b64decode(data["content"]).decode(),
+                         'name = "hello_weft"\ndeps = ["cogwork"]\nowner = "someone"\n')
+
+    def test_a_dry_run_shows_the_deps(self):
+        self.declare_deps(["base", "cogwork"])
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.submit(dry_run=True)
+        self.assertIn('deps = ["cogwork"]', err.getvalue())
+
+    def test_a_dry_run_opens_nothing(self):
+        urls, calls, gh_calls = self.submit(dry_run=True)
+        self.assertEqual(urls, [])
+        self.assertIn("gh=none helper=none", calls[0])
+        self.assertNotIn("/user", gh_calls)
+        self.assertEqual(weftmod.proposed_file(
+            "x\nhttps://github.com/Weft-Rust/Weft-Mods-Index/new/main?filename=mods/a/1.toml"
+            "&value=name%20%3D%20%22a%22%0A\n"), ("mods/a/1.toml", 'name = "a"\n'))
+
+    def test_what_the_index_has_or_is_proposed_is_left_out(self):
+        self.responses[f"{self.INDEX}/contents/mods/hello_weft/0.1.0.toml"] = {"type": "file"}
+        self.assertEqual(self.submit()[:2], ([], []))
+        del self.responses[f"{self.INDEX}/contents/mods/hello_weft/0.1.0.toml"]
+        url = "https://github.com/Weft-Rust/Weft-Mods-Index/pull/3"
+        self.responses[f"{self.INDEX}/pulls?state=open&head=someone:hello_weft-0.1.0"] = [
+            {"html_url": url}]
+        self.assertEqual(self.submit()[:2], ([url], []))
+
+    def test_a_stale_branch_is_deleted_first(self):
+        ref = "/repos/someone/Weft-Mods-Index/git/ref/heads/hello_weft-0.1.0"
+        self.responses[ref] = {"ref": "refs/heads/hello_weft-0.1.0"}
+        _, calls, gh_calls = self.submit()
+        self.assertIn("DELETE /repos/someone/Weft-Mods-Index/git/refs/heads/hello_weft-0.1.0",
+                      gh_calls)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_build_before_leaves_no_dirt(self):
+        # The tag before built here: cargo rewrote Cargo.lock, or wrote an untracked one.
+        (self.clone / "hello" / "Cargo.lock").write_text("# rewritten\n")
+        (self.clone / "hello" / "stray.lock").write_text("# untracked\n")
+        self.assertEqual(len(self.submit()[0]), 1)
+
+    def test_a_release_candidate_is_refused(self):
+        tag = "hello_weft-v0.1.1-rc.4.gabcdef0"
+        self.responses[f"/repos/{self.REPO}/commits/{tag}"] = {"sha": self.commit}
+        with self.assertRaisesRegex(weftmod.Error, "Cargo.toml says version 0.1.0"):
+            self.submit([tag])
+
+    def test_the_default_is_the_newest_full_release(self):
+        self.responses[f"/repos/{self.REPO}/releases"] = [
+            {"tag_name": "hello_weft-v0.1.1-rc.1.gabcdef0", "draft": False, "prerelease": True,
+             "published_at": "2026-11-02T00:00:00Z"},
+            {"tag_name": self.TAG, "draft": False, "prerelease": False,
+             "published_at": "2026-11-01T00:00:00Z"}]
+        self.assertEqual(weftmod.latest_tags(FakeGitHub(self.responses), self.REPO,
+                                             [self.clone / "hello"]), [self.TAG])
+        self.assertEqual(len(self.submit(tags=())[0]), 1)
 
 
 if __name__ == "__main__":

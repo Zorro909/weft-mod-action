@@ -1,8 +1,10 @@
 # Copy to .github/workflows/release.yml in your mod's repository.
 # On every push to main: a mod whose Cargo.toml version has no release yet is released at that
 # version; a mod that changed since its newest release gets a release candidate,
-# X.Y.(Z+1)-rc.<run>.g<commit>. Each release holds <id>.zip, with its weft-mod.toml, and
-# <id>.mod.json, the zip's build provenance attestation.
+# X.Y.(Z+1)-rc.<run>.g<commit>. Each release holds <id>.zip, the mod's libraries and assets.
+# Off by default: the index-pr job proposes each full release to the Weft mod index. To turn it
+# on, add the secret WEFT_INDEX_TOKEN (see README.md) and the repository variable
+# WEFT_INDEX_PR = true (Settings > Secrets and variables > Actions > Variables).
 name: Release
 
 on:
@@ -38,12 +40,27 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      releases: ${{ steps.release.outputs.releases }}
     permissions:
       contents: write     # the releases
-      id-token: write     # the provenance attestations
-      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - uses: Zorro909/weft-mod-action/release@v2
+      - id: release
+        uses: Zorro909/weft-mod-action/release@v2
+
+  # Each full release (X.Y.Z, not a release candidate), to the Weft mod index.
+  index-pr:
+    needs: release
+    if: needs.release.outputs.releases != '' && vars.WEFT_INDEX_PR == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Zorro909/weft-mod-action/index-pr@v2
+        with:
+          token: ${{ secrets.WEFT_INDEX_TOKEN }}
+          tags: ${{ needs.release.outputs.releases }}
+          # mods: |          # the same folders as above
+          #   cogwork
+          #   structures

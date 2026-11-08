@@ -45,7 +45,6 @@ jobs:
         uses: ./release
         with:
           github-release: false
-          attest: false
       - name: Check the package
         env:
           TAGS: ${{ steps.release.outputs.tags }}
@@ -54,15 +53,10 @@ jobs:
           test "$TAGS" = hello_weft-v0.1.0
           dist="$RUNNER_TEMP/weft-mod-dist/$TAGS"
           unzip -l "$dist/hello_weft.zip"
-          unzip -p "$dist/hello_weft.zip" weft-mod.toml
-          test ! -e "$dist/hello_weft.mod.json" # only with an attestation
           python3 - "$dist" <<'EOF'
-          import sys, tomllib, zipfile
+          import sys, zipfile
           from pathlib import Path
           z = zipfile.ZipFile(Path(sys.argv[1]) / "hello_weft.zip")
-          info = tomllib.loads(z.read("weft-mod.toml").decode())
-          assert info == {"id": "hello_weft", "name": "Hello Weft", "version": "0.1.0",
-                          "abi": "d4cb65bd4fa1ac78", "deps": ["base"]}, info  # Weft v26.11.2
-          assert {"weft-mod.toml", "hello_weft.dll", "libhello_weft.so", "libhello_weft.dylib",
+          assert {"hello_weft.dll", "libhello_weft.so", "libhello_weft.dylib",
                   "assets/lang/en_us.lang", "assets/textures/gui/icon.png"} == set(z.namelist())
           EOF

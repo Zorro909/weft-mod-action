@@ -1,16 +1,10 @@
 name: Release Weft mods
 description: >-
-  Packs each mod the build action built into `<id>.zip`, attests its build provenance into
-  `<id>.mod.json`, and creates a GitHub release of each. Run it after the build jobs, on a
-  checkout of the same commit (with submodules, if Weft is one).
+  Packs each mod the build action built into `<id>.zip`, and creates a GitHub release of each.
+  Run it after the build jobs, on a checkout of the same commit (with submodules, if Weft is one).
 inputs:
   github-release:
-    description: Create a GitHub release of each mod. Either way, the files are a workflow artifact.
-    default: "true"
-  attest:
-    description: >-
-      Attest the build provenance of each zip, into its `<id>.mod.json`. Needs the permissions
-      `id-token: write` and `attestations: write`. A GitHub release needs it.
+    description: Create a GitHub release of each mod. Either way, the zips are a workflow artifact.
     default: "true"
   require-platforms:
     description: The platforms each zip must have a library for, separated by spaces.
@@ -22,6 +16,11 @@ outputs:
   tags:
     description: The tags released, separated by spaces; empty when there was nothing new.
     value: ${{ steps.package.outputs.tags }}
+  releases:
+    description: >-
+      The tags of the full releases this run made (`X.Y.Z`; no release candidates), separated by
+      spaces: what can be proposed to the mod index. Empty without `github-release`.
+    value: ${{ steps.release.outputs.releases }}
 runs:
   using: composite
   steps:
@@ -41,35 +40,21 @@ runs:
           --require "$REQUIRE")
         echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
-    - id: attest
-      if: steps.package.outputs.tags != '' && inputs.attest == 'true'
-      uses: actions/attest-build-provenance@v4
-      with:
-        subject-path: ${{ runner.temp }}/weft-mod-dist/*/*.zip
-
-    - if: steps.attest.outcome == 'success'
-      shell: bash
-      env:
-        BUNDLES: ${{ steps.attest.outputs.bundle-path }}
-      run: |
-        source "$GITHUB_ACTION_PATH/../python.sh"
-        python "$GITHUB_ACTION_PATH/../weftmod.py" attach --dist "$RUNNER_TEMP/weft-mod-dist" \
-          --bundles "$BUNDLES"
-
     - if: steps.package.outputs.tags != '' && inputs.github-release == 'true'
+      id: release
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         GH_REPO: ${{ github.repository }}
       run: |
         source "$GITHUB_ACTION_PATH/../python.sh"
-        python "$GITHUB_ACTION_PATH/../weftmod.py" release --dist "$RUNNER_TEMP/weft-mod-dist"
+        set -euo pipefail
+        releases=$(python "$GITHUB_ACTION_PATH/../weftmod.py" release --dist "$RUNNER_TEMP/weft-mod-dist")
+        echo "releases=$releases" >> "$GITHUB_OUTPUT"
 
     - if: steps.package.outputs.tags != ''
       uses: actions/upload-artifact@v7
       with:
         name: weft-mods
-        path: |
-          ${{ runner.temp }}/weft-mod-dist/*/*.zip
-          ${{ runner.temp }}/weft-mod-dist/*/*.mod.json
+        path: ${{ runner.temp }}/weft-mod-dist/*/*.zip
         retention-days: 30
