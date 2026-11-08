@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import hashlib
 import io
 import json
 import shutil
@@ -131,36 +130,6 @@ class Metadata(unittest.TestCase):
         self.assertIsNone(weftmod.with_deps('name = "m"\n', ["a"]))
 
 
-def bundle(*digests: str) -> dict:
-    statement = {"_type": "https://in-toto.io/Statement/v1",
-                 "subject": [{"name": "x.zip", "digest": {"sha256": d}} for d in digests]}
-    return {"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
-            "dsseEnvelope": {"payload": base64.b64encode(json.dumps(statement).encode()).decode(),
-                             "payloadType": "application/vnd.in-toto+json"}}
-
-
-class Attach(TempDir):
-    def test_each_zip_gets_the_bundle_that_names_it(self):
-        entries = []
-        for mod_id in ("a", "b"):
-            (self.tmp / f"{mod_id}-v1.0.0").mkdir()
-            (self.tmp / f"{mod_id}-v1.0.0" / f"{mod_id}.zip").write_bytes(mod_id.encode())
-            entries.append({"id": mod_id, "tag": f"{mod_id}-v1.0.0"})
-        a, b = (hashlib.sha256(x).hexdigest() for x in (b"a", b"b"))
-        lines = self.tmp / "attestation.jsonl"
-        lines.write_text(json.dumps(bundle("0" * 64)) + "\n" + json.dumps(bundle(b, a)) + "\n")
-        weftmod.attach(entries, self.tmp, weftmod.read_bundles(lines))
-        for mod_id in ("a", "b"):
-            info = json.loads((self.tmp / f"{mod_id}-v1.0.0" / f"{mod_id}.mod.json").read_text())
-            self.assertEqual(info, {"attestation": bundle(b, a)})
-
-    def test_a_zip_without_a_bundle_fails(self):
-        one = self.tmp / "bundle.json"
-        one.write_text(json.dumps(bundle("0" * 64), indent=2))
-        with self.assertRaisesRegex(weftmod.Error, "no attestation"):
-            weftmod.bundle_for("1" * 64, weftmod.read_bundles(one))
-
-
 class Folders(TempDir):
     def test_submodules_of_weft(self):
         (self.tmp / ".gitmodules").write_text(
@@ -273,8 +242,10 @@ class MergeBuilds(TempDir):
             weftmod.merge_builds(self.tmp / "artifacts", self.tmp / "out")
 
 
-# Stands in for `weft --submit-mod`: records how it was run, and prints what weft prints.
+# Stands in for `weft --submit-mod`: refuses a dirty checkout as weft does, records how it was
+# run, and prints what weft prints.
 FAKE_WEFT = """#!/bin/sh
+if [ -n "$(git status --porcelain)" ]; then echo "commit your changes first"; exit 1; fi
 echo "$PWD $* gh=${GH_TOKEN:-none} helper=${GIT_CONFIG_VALUE_1:-none}" >> "$(dirname "$0")/calls"
 if [ -n "$GH_TOKEN" ]; then
   echo "pull request opened: https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"
@@ -393,6 +364,12 @@ class Submit(TempDir):
         self.assertIn("DELETE /repos/someone/Weft-Mods-Index/git/refs/heads/hello_weft-0.1.0",
                       gh_calls)
         self.assertEqual(len(calls), 1)
+
+    def test_a_build_before_leaves_no_dirt(self):
+        # The tag before built here: cargo rewrote Cargo.lock, or wrote an untracked one.
+        (self.clone / "hello" / "Cargo.lock").write_text("# rewritten\n")
+        (self.clone / "hello" / "stray.lock").write_text("# untracked\n")
+        self.assertEqual(len(self.submit()[0]), 1)
 
     def test_a_release_candidate_is_refused(self):
         tag = "hello_weft-v0.1.1-rc.4.gabcdef0"

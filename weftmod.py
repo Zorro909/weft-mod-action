@@ -5,8 +5,7 @@ Python 3.10 or newer, so that it runs on every GitHub runner as it is.
     plan        which mods to release, at which versions        (build/action.yml, on each runner)
     build       set those versions, `cargo build --release`, copy the libraries
     package     merge the runners' builds into each mod's `<id>.zip`  (release/action.yml)
-    attach      each zip's `<id>.mod.json`, from its attestation
-    release     a GitHub release of each package
+    release     a GitHub release of each zip
     submit      propose releases to the mod index with `weft --submit-mod`  (index-pr/action.yml)
 
 A mod is a folder with a Cargo.toml that builds a `cdylib`; its id is that library's name. See
@@ -17,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import os
 import re
@@ -404,55 +402,23 @@ def package(root: Path, artifacts: Path, dist: Path, require: list[str]) -> list
 
 
 # ---------------------------------------------------------------------------------------------
-# attach: <id>.mod.json
-
-
-def read_bundles(path: Path) -> list[dict]:
-    """The Sigstore bundles in the file that `actions/attest-build-provenance` names as its
-    `bundle-path`: one bundle per line (or one JSON document)."""
-    text = path.read_text(encoding="utf-8")
-    try:
-        return [json.loads(text)]
-    except ValueError:
-        return [json.loads(line) for line in text.splitlines() if line.strip()]
-
-
-def bundle_for(sha256: str, bundles: list[dict]) -> dict:
-    """The bundle whose in-toto statement has a subject with this sha256."""
-    for b in bundles:
-        statement = json.loads(base64.b64decode(b["dsseEnvelope"]["payload"]))
-        if any(s.get("digest", {}).get("sha256") == sha256 for s in statement["subject"]):
-            return b
-    raise Error(f"no attestation has the subject sha256:{sha256}")
-
-
-def attach(entries: list[dict], dist: Path, bundles: list[dict]) -> None:
-    """`<id>.mod.json` next to each zip: `{"attestation": <its bundle>}`."""
-    for e in entries:
-        folder = dist / e["tag"]
-        digest = hashlib.sha256((folder / f"{e['id']}.zip").read_bytes()).hexdigest()
-        (folder / f"{e['id']}.mod.json").write_text(
-            json.dumps({"attestation": bundle_for(digest, bundles)}) + "\n", encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------------------------
 # release, latest_tags
 
 
-def release(entries: list[dict], dist: Path, sha: str) -> None:
-    """A GitHub release of each package, at the commit that was built (with `gh`)."""
+def release(entries: list[dict], dist: Path, sha: str) -> list[str]:
+    """A GitHub release of each zip, at the commit that was built (with `gh`). Returns the tags of
+    the full releases (no release candidates): what can go to the index."""
     for e in entries:
-        files = [dist / e["tag"] / f"{e['id']}.{ext}" for ext in ("zip", "mod.json")]
-        if not files[1].is_file():
-            raise Error(f"{e['tag']}: no {files[1].name}; the release needs the attestation")
-        cmd = ["gh", "release", "create", e["tag"], *map(str, files), "--target", sha,
-               "--title", f"{e['id']} {e['version']}", "--generate-notes"]
+        cmd = ["gh", "release", "create", e["tag"], str(dist / e["tag"] / f"{e['id']}.zip"),
+               "--target", sha, "--title", f"{e['id']} {e['version']}", "--generate-notes"]
         if e["since"]:
             cmd += ["--notes-start-tag", e["since"]]
         if e["kind"] != "release":
             cmd += ["--prerelease", "--latest=false"]
-        if subprocess.run(cmd).returncode != 0:
+        # gh prints each release's URL: to the log, not to the tags this prints.
+        if subprocess.run(cmd, stdout=sys.stderr).returncode != 0:
             raise Error(f"{e['tag']}: gh release create failed")
+    return [e["tag"] for e in entries if e["kind"] == "release"]
 
 
 def latest_tags(gh: GitHub, repo: str, folders: list[Path]) -> list[str]:
@@ -595,7 +561,9 @@ def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str], weft:
         commit = (gh.api(f"/repos/{repo}/commits/{tag}") or {}).get("sha")
         if not commit:
             raise Error(f"{tag}: {repo} has no such tag")
-        git(clone, "checkout", "-q", "--detach", commit)
+        # A build for the tag before may have left a Cargo.lock: weft wants a clean checkout.
+        git(clone, "checkout", "-q", "--force", "--detach", commit)
+        git(clone, "clean", "-q", "-fd")
         mod = next((m for m in submit_mods(spec, clone) if m.id == mod_id), None)
         if mod is None:
             raise Error(f"{tag}: no folder in `mods` holds the mod {mod_id} at {commit[:7]}")
@@ -658,9 +626,6 @@ def main(argv=None) -> int:
     c.add_argument("--artifacts", type=Path, required=True)
     c.add_argument("--dist", type=Path, required=True)
     c.add_argument("--require", default=" ".join(PLATFORMS))
-    c = sub.add_parser("attach")
-    c.add_argument("--dist", type=Path, required=True)
-    c.add_argument("--bundles", type=Path, required=True)
     c = sub.add_parser("release")
     c.add_argument("--dist", type=Path, required=True)
     c = sub.add_parser("submit", help="--root is a clone of the mod repository, which it checks out")
@@ -682,11 +647,9 @@ def main(argv=None) -> int:
         elif args.command == "package":
             entries = package(args.root, args.artifacts, args.dist, args.require.split())
             print(" ".join(e["tag"] for e in entries))
-        elif args.command == "attach":
-            attach(json.loads((args.dist / "plan.json").read_text()), args.dist,
-                   read_bundles(args.bundles))
         elif args.command == "release":
-            release(json.loads((args.dist / "plan.json").read_text()), args.dist, sha)
+            print(" ".join(release(json.loads((args.dist / "plan.json").read_text()), args.dist,
+                                   sha)))
         elif args.command == "submit":
             print(" ".join(submit(gh, args.root, repo, args.mods, args.tags.split(), args.weft,
                                   args.dry_run)))

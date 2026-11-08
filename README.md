@@ -5,13 +5,10 @@ GitHub Actions that release [Weft](https://github.com/Weft-Rust/Weft) mods and p
 
 - **`build`** decides which mods to release and at which version, then builds them with cargo on
   the runner it runs on. Run it on Windows, Linux and macOS.
-- **`release`** packs each mod into `<id>.zip`, attests its build provenance into
-  `<id>.mod.json`, and creates a GitHub release of each.
+- **`release`** packs each mod into `<id>.zip` and creates a GitHub release of each.
 - **`index-pr`** proposes releases to the mod index with Weft's own `weft --submit-mod`.
 
-They are composite actions, so they run as steps of your own workflow. The provenance attestation
-then names your repository's workflow as its signer, which is what the index and the launcher
-check.
+They are composite actions, so they run as steps of your own workflow.
 
 ## Releasing
 
@@ -36,8 +33,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -89,8 +84,7 @@ version it releases, so that the library reports it, but doesn't commit that cha
 
 | Input | Default | |
 | --- | --- | --- |
-| `github-release` | `true` | Create the GitHub releases. With `false`, the packages are only the workflow artifact `weft-mods`. |
-| `attest` | `true` | Attest the zips' build provenance, into their `<id>.mod.json`. A GitHub release needs this. |
+| `github-release` | `true` | Create the GitHub releases. With `false`, the zips are only the workflow artifact `weft-mods`. |
 | `require-platforms` | `windows-x64 linux-x64 macos-arm64` | The platforms every zip must have. |
 
 Both have the output `tags`: the tags released, separated by spaces. `release` also has the output
@@ -99,15 +93,9 @@ Both have the output `tags`: the tags released, separated by spaces. `release` a
 
 ### What a release holds
 
-Each release has two assets, which the launcher reads:
-
-| Asset | Content |
-| --- | --- |
-| `<id>.zip` | The Windows, Linux and macOS libraries (`<id>.dll`, `lib<id>.so`, `lib<id>.dylib`) at its top, and the mod's `assets/` folder, as `weft --pack-mod` packs them |
-| `<id>.mod.json` | `{"attestation": <bundle>}`: the Sigstore bundle of the zip's build provenance attestation, as `actions/attest-build-provenance` writes it |
-
-When several mods release in one run, one attestation covers all their zips, and each
-`<id>.mod.json` holds that bundle.
+Each release has one asset, `<id>.zip`: the Windows, Linux and macOS libraries (`<id>.dll`,
+`lib<id>.so`, `lib<id>.dylib`) at its top, and the mod's `assets/` folder, as `weft --pack-mod`
+packs them. Anyone can install it by hand; the launcher instead lists the index's own builds.
 
 ## Proposing to the index
 
@@ -207,7 +195,7 @@ deps = ["base", "cogwork"]
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests   # needs cargo for the plan and propose tests
+python3 -m unittest discover -s tests   # the plan and submit tests need cargo, and submit git
 ```
 
 `weftmod.py` does the work, with the Python standard library only, so that it runs on every runner
