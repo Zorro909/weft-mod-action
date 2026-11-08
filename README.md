@@ -6,7 +6,7 @@ GitHub Actions that release [Weft](https://github.com/Weft-Rust/Weft) mods and p
 - **`build`** decides which mods to release and at which version, then builds them with cargo on
   the runner it runs on. Run it on Windows, Linux and macOS.
 - **`release`** packs each mod into `<id>.zip` and creates a GitHub release of each.
-- **`index-pr`** proposes releases to the mod index with Weft's own `weft --submit-mod`.
+- **`index-pr`** proposes releases to the mod index, as Weft's `weft --submit-mod` does.
 
 They are composite actions, so they run as steps of your own workflow.
 
@@ -101,14 +101,16 @@ packs them. Anyone can install it by hand; the launcher instead lists the index'
 
 The [Weft mod index](https://github.com/Weft-Rust/Weft-Mods-Index) builds each mod itself, from
 its source at the commit proposed, and lists it in the launcher. `index-pr` proposes a release
-the way the index asks: it runs [`weft --submit-mod`](https://github.com/Weft-Rust/Weft-Mods-Index#sending-a-mod)
-at the commit of the release's tag. So the pull request is always in the form the current Weft
-writes. Each release is one pull request, which adds `mods/<id>/<version>.toml`.
+the way the index asks, as [`weft --submit-mod`](https://github.com/Weft-Rust/Weft-Mods-Index#sending-a-mod)
+does, at the commit of the release's tag. Each release is one pull request, which adds
+`mods/<id>/<version>.toml`.
 
 The index builds the mod's folder alone, without submodules, at the version in its `Cargo.toml`.
 So a mod it takes:
 
-- takes the SDK from the game's repository at a release tag:
+- takes the SDK from the game's repository at a release tag, with one line in its own
+  `Cargo.toml` (under `[dependencies]`, or `[workspace.dependencies]` when the mod is its own
+  workspace), which the index sets to the Weft it builds against:
   `weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "v26.11.3" }`;
 - has a `[package] name` that is its library's name, the mod id;
 - is proposed at a release of the version in its `Cargo.toml`. A release candidate that `build`
@@ -162,30 +164,32 @@ For each tag, `index-pr`:
 
 1. leaves it out when the index has that version, or when the token's account has an open pull
    request for it;
-2. clones your repository and checks out the tag's commit;
-3. runs `weft --submit-mod <folder>` with the token. weft builds the mod once, forks the index to
-   the token's account and opens the pull request.
+2. requires a GitHub release of the tag, as `release` makes once the mod has built on every
+   system (or any other release of it). So it builds nothing itself: run it after `release`;
+3. clones your repository, checks out the tag's commit and checks the mod as above;
+4. writes `mods/<id>/<version>.toml` as `weft --submit-mod` would;
+5. forks the index to the token's account, or reuses the fork it has, and opens the pull request
+   `<id> <version>` from the branch `<id>-<version>` of the fork, which holds just that file. A
+   branch of that name left from before is reset first.
 
-The `weft` binary comes from the newest Weft release. While no release has `--submit-mod` yet, it
-is built from Weft's default branch, which takes a few minutes the first time and is cached
-afterwards.
+It does it all with GitHub's API, without the `weft` binary.
 
 | Input | Default | |
 | --- | --- | --- |
 | `token` | | The token. |
 | `tags` | the newest full release of each mod | Release tags, separated by spaces. |
 | `mods` | `.` | The mod folders. |
-| `weft-version` | `latest` | The Weft whose `weft --submit-mod` runs: `latest`, a release tag, or a branch or commit of Weft to build. |
-| `rust-toolchain` | `stable` | The toolchain for weft's test build; empty to use the runner's. |
-| `dry-run` | `false` | Only show each file; open no pull request. |
+| `dry-run` | `false` | Do everything but write to GitHub: print each file, open no pull request. |
 
-Its output `urls` is the pull requests, separated by spaces. It runs on Linux.
+Its output `urls` is the pull requests, separated by spaces, with those that were open already. It
+runs on Linux, and reads each mod with the runner's `cargo metadata`.
 
-weft writes the file as it sees fit: at present `name` is the mod id and `summary` is
-`[package] description`. Its `deps` it leaves empty, so `index-pr` sets them, with a commit on the
-pull request's branch: the mod ids the mod needs besides `base`, from `[package.metadata.weft] deps`,
-or else the `deps` of `declare_mod!` in the library's source. When `declare_mod!` can't be read as
-plain string literals (a macro, or several under `#[cfg]`), set the deps yourself:
+The file, like weft's, has `name`, the mod id; `summary`, `[package] description`; `author` and
+`owner`, the token's account; `repo`, `dir` and `commit`, where to build; and `weft`, the tag of
+`weft_sdk`. Its `deps` are the mod ids the mod needs besides `base` (which weft leaves empty):
+from `[package.metadata.weft] deps`, or else the `deps` of `declare_mod!` in the library's source.
+When `declare_mod!` can't be read as plain string literals (a macro, or several under `#[cfg]`), set
+the deps yourself:
 
 ```toml
 [package.metadata.weft]

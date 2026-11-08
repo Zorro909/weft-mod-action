@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -46,7 +47,9 @@ def macho() -> bytes:
 
 
 class FakeGitHub:
-    """Answers `api` from a dict of path -> JSON; anything else is a 404 (None)."""
+    """Answers `api` from a dict: a GET by its path, anything else by "METHOD path". What isn't in
+    it is a 404 (None) for a GET, and `{}` (done) for anything else. An answer that is a list of
+    answers gives one per call, the last one ever after; an Error in it is raised."""
 
     def __init__(self, responses: dict | None = None):
         self.responses = responses or {}
@@ -54,13 +57,23 @@ class FakeGitHub:
         self.sent: list[tuple[str, dict]] = []
 
     def api(self, path, method="GET", data=None):
-        self.calls.append(path if method == "GET" else f"{method} {path}")
+        key = path if method == "GET" else f"{method} {path}"
+        self.calls.append(key)
         if data is not None:
-            self.sent.append((f"{method} {path}", data))
-        return self.responses.get(path)
+            self.sent.append((key, data))
+        answer = self.responses.get(key, None if method == "GET" else {})
+        if isinstance(answer, Answers):
+            answer = answer.pop(0) if len(answer) > 1 else answer[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     def pages(self, path):
         return self.responses.get(path, [])
+
+
+class Answers(list):
+    """Answers to the same call in turn, for FakeGitHub."""
 
 
 class TempDir(unittest.TestCase):
@@ -120,14 +133,6 @@ class Metadata(unittest.TestCase):
                     'fn main() {}']:
             with self.assertRaisesRegex(weftmod.Error, r"package\.metadata\.weft"):
                 weftmod.parse_deps(src, "m")
-
-    def test_with_deps(self):
-        text = 'name = "m"\n# Mod ids it needs besides base.\ndeps = []\nowner = "o"\n'
-        self.assertEqual(weftmod.with_deps(text, ["cogwork", "a_b"]),
-                         'name = "m"\n# Mod ids it needs besides base.\n'
-                         'deps = ["cogwork", "a_b"]\nowner = "o"\n')
-        self.assertEqual(weftmod.with_deps(text, []), text)
-        self.assertIsNone(weftmod.with_deps('name = "m"\n', ["a"]))
 
 
 class Folders(TempDir):
@@ -242,18 +247,78 @@ class MergeBuilds(TempDir):
             weftmod.merge_builds(self.tmp / "artifacts", self.tmp / "out")
 
 
-# Stands in for `weft --submit-mod`: refuses a dirty checkout as weft does, records how it was
-# run, and prints what weft prints.
-FAKE_WEFT = """#!/bin/sh
-if [ -n "$(git status --porcelain)" ]; then echo "commit your changes first"; exit 1; fi
-echo "$PWD $* gh=${GH_TOKEN:-none} helper=${GIT_CONFIG_VALUE_1:-none}" >> "$(dirname "$0")/calls"
-if [ -n "$GH_TOKEN" ]; then
-  echo "pull request opened: https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"
-else
-  echo "GitHub opened in the browser: fill in its name and summary if you like."
-  echo "https://github.com/Weft-Rust/Weft-Mods-Index/new/main?filename=mods/hello_weft/0.1.0.toml&value=name%20%3D%20%22hello_weft%22%0Adeps%20%3D%20%5B%5D%0A"
-fi
+# The fixture's file, as `weft --submit-mod` writes it at Weft 85f85db (crates/app/src/submit.rs),
+# for the owner someone, in the folder hello of someone/mods.
+WEFT_FILE = """# Shown in the launcher. The newest version's say what the mod is.
+name = "hello_weft"
+summary = "A mod that does nothing, for testing weft-mod-action."
+author = "someone"
+
+# What is built: the crate in `dir` of `repo` at `commit`, against the SDK of `weft`.
+repo = "https://github.com/someone/mods"
+dir = "hello"
+commit = "{commit}"
+weft = "v26.11.2"
+# Mod ids it needs besides base, installed with it.
+deps = []
+# The GitHub login the id belongs to: only they can add versions.
+owner = "someone"
+# Set by a maintainer who read the source of this commit.
+reviewed = ""
 """
+
+# The fields of an index file, in order (the index's scripts/common.py).
+INDEX_FIELDS = ["name", "summary", "author", "repo", "dir", "commit", "weft", "deps", "owner",
+                "reviewed"]
+
+
+class IndexFile(unittest.TestCase):
+    def test_as_weft_writes_it(self):
+        self.assertEqual(
+            weftmod.index_file("hello_weft", "A mod that does nothing, for testing weft-mod-action.",
+                               "someone", "https://github.com/someone/mods", "hello", SHA,
+                               "v26.11.2", []),
+            WEFT_FILE.format(commit=SHA))
+
+    def test_deps_and_escapes(self):
+        text = weftmod.index_file("m", 'Says "hi"\\ to\nyou, ünïcode', "o", "https://github.com/o/r",
+                                  "", SHA, "v1.2.3", ["cogwork", "a_b"])
+        self.assertIn('deps = ["cogwork", "a_b"]\n', text)
+        self.assertIn('dir = ""\n', text)
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10
+            return
+        data = tomllib.loads(text)
+        self.assertEqual(list(data), INDEX_FIELDS)
+        self.assertEqual(data["summary"], 'Says "hi"\\ to\nyou, ünïcode')
+        self.assertEqual(data["deps"], ["cogwork", "a_b"])
+
+
+class SdkTag(TempDir):
+    def tag(self, toml):
+        (self.tmp / "Cargo.toml").write_text(toml)
+        mod = mock.Mock(folder=self.tmp)
+        return weftmod.sdk_tag(mod)
+
+    def test_the_weft_release(self):
+        self.assertEqual(weftmod.sdk_tag(mock.Mock(folder=FIXTURE)), "v26.11.2")
+        # A mod that is its own workspace, as structgen in Zorro909/weft-mods.
+        self.assertEqual(self.tag(
+            '[dependencies]\nweft_sdk.workspace = true\n\n[workspace.dependencies]\n'
+            'weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "v26.11.3" }\n'
+            'base_api = { git = "https://github.com/Weft-Rust/Weft", tag = "v26.11.3" }\n'),
+            "v26.11.3")
+
+    def test_only_what_the_index_can_set(self):
+        for toml in [
+                'weft_sdk = { git = "https://github.com/Weft-Rust/Weft", branch = "main" }\n',
+                'weft_sdk = { git = "https://github.com/Weft-Rust/Weft.git", tag = "v1.0.0" }\n',
+                'weft_sdk.workspace = true\n',  # from a workspace above: not in this Cargo.toml
+                'weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "v1.0.0" }\n'
+                '[target.x.dependencies]\n'
+                'weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "v1.0.1" }\n']:
+            self.assertIsNone(self.tag(toml), toml)
 
 
 @unittest.skipUnless(shutil.which("cargo") and shutil.which("git"), "needs cargo and git")
@@ -261,7 +326,10 @@ class Submit(TempDir):
     REPO = "someone/mods"
     TAG = "hello_weft-v0.1.0"
     INDEX = "/repos/Weft-Rust/Weft-Mods-Index"
-    FORK_FILE = "/repos/someone/Weft-Mods-Index/contents/mods/hello_weft/0.1.0.toml"
+    FORK = "/repos/someone/Weft-Mods-Index"
+    PATH = "mods/hello_weft/0.1.0.toml"
+    BRANCH = "hello_weft-0.1.0"
+    MAIN = "fedcba9876543210fedcba9876543210fedcba98"
 
     def setUp(self):
         super().setUp()
@@ -272,108 +340,170 @@ class Submit(TempDir):
         subprocess.run(git + ["add", "-A"], check=True)
         subprocess.run(git + ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"],
                        check=True)
-        self.commit = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True,
-                                     check=True).stdout.strip()
-        self.weft = self.tmp / "bin" / "weft"
-        self.weft.parent.mkdir()
-        self.weft.write_text(FAKE_WEFT)
-        self.weft.chmod(0o755)
-        self.responses = {"/user": {"login": "someone", "id": 5},
-                          f"/repos/{self.REPO}/commits/{self.TAG}": {"sha": self.commit},
-                          f"{self.INDEX}/pulls/7": {"head": {
-                              "repo": {"full_name": "someone/Weft-Mods-Index"},
-                              "ref": "hello_weft-0.1.0"}},
-                          f"{self.FORK_FILE}?ref=hello_weft-0.1.0": {
-                              "sha": "blob1", "content": base64.b64encode(
-                                  b'name = "hello_weft"\ndeps = []\nowner = "someone"\n').decode()}}
+        self.commit = self.head()
+        self.responses = {
+            "/user": {"login": "someone", "id": 5},
+            f"/repos/{self.REPO}/commits/{self.TAG}": {"sha": self.commit},
+            f"/repos/{self.REPO}/releases/tags/{self.TAG}": {"draft": False},
+            self.INDEX: {"default_branch": "main"},
+            f"{self.INDEX}/git/ref/heads/main": {"object": {"sha": self.MAIN}},
+            # The fork from before.
+            self.FORK: {"full_name": "someone/Weft-Mods-Index", "fork": True,
+                        "parent": {"full_name": "Weft-Rust/Weft-Mods-Index"}},
+            f"{self.FORK}/git/ref/heads/main": {"object": {"sha": "0" * 40}},
+            f"POST {self.INDEX}/pulls": {
+                "html_url": "https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"}}
+
+    def head(self):
+        return subprocess.run(["git", "-C", str(self.clone), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
 
     def declare_deps(self, deps):
         """A new commit of the mod, which declares these deps, for the tag."""
         cargo = self.clone / "hello" / "Cargo.toml"
         cargo.write_text(cargo.read_text().replace(
             "[lib]", f"[package.metadata.weft]\ndeps = {json.dumps(deps)}\n\n[lib]"))
-        git = ["git", "-C", str(self.clone)]
-        subprocess.run(git + ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "d"],
-                       check=True)
-        self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": subprocess.run(
-            git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()}
+        subprocess.run(["git", "-C", str(self.clone), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qam", "d"], check=True)
+        self.commit = self.head()
+        self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.commit}
 
-    def submit(self, tags=(TAG,), dry_run=False, env=None):
+    def submit(self, tags=(TAG,), dry_run=False):
+        """Runs submit; returns its URLs. Leaves the GitHub calls in self.calls and self.sent."""
         gh = FakeGitHub(self.responses)
-        old = dict(os.environ)
-        os.environ.update(env if env is not None else {"GH_TOKEN": "tok"})
         try:
-            urls = weftmod.submit(gh, self.clone, self.REPO, "hello", list(tags), str(self.weft),
-                                  dry_run)
+            with mock.patch.object(weftmod.time, "sleep") as self.sleep, \
+                    mock.patch.object(weftmod.subprocess, "run", wraps=subprocess.run) as self.run:
+                return weftmod.submit(gh, self.clone, self.REPO, "hello", list(tags), dry_run)
         finally:
-            os.environ.clear()
-            os.environ.update(old)
-        calls = (self.weft.parent / "calls").read_text().splitlines() \
-            if (self.weft.parent / "calls").exists() else []
-        self.sent = gh.sent
-        return urls, calls, gh.calls
+            self.calls, self.sent = gh.calls, dict(gh.sent)
 
-    def test_runs_weft_in_the_mod_folder_at_the_tagged_commit(self):
-        urls, calls, _ = self.submit()
-        self.assertEqual(urls, ["https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"])
-        folder = self.clone / "hello"
-        self.assertEqual(calls, [f"{folder} --submit-mod {folder} gh=tok "
-                                 f"helper=!gh auth git-credential"])
+    def writes(self):
+        return [c for c in self.calls if c.split(" ", 1)[0] in ("POST", "PUT", "PATCH", "DELETE")]
 
-    def test_only_base_needs_no_commit(self):
-        self.submit()  # the fixture's declare_mod! has deps: ["base"]
-        self.assertEqual(self.sent, [])
+    def test_proposes_the_file_from_the_fork(self):
+        self.assertEqual(self.submit(), ["https://github.com/Weft-Rust/Weft-Mods-Index/pull/7"])
+        self.assertEqual(self.head(), self.commit)
+        # The release built it already: nothing is built here.
+        self.assertFalse([c for c in self.run.call_args_list if c.args[0][:2] == ["cargo", "build"]])
+        self.assertEqual(self.writes(), [
+            f"POST {self.FORK}/merge-upstream",
+            f"POST {self.FORK}/git/refs",
+            f"PUT {self.FORK}/contents/{self.PATH}",
+            f"POST {self.INDEX}/pulls"])
+        self.assertEqual(self.sent[f"POST {self.FORK}/git/refs"],
+                         {"ref": f"refs/heads/{self.BRANCH}", "sha": self.MAIN})
+        put = self.sent[f"PUT {self.FORK}/contents/{self.PATH}"]
+        self.assertEqual((put["message"], put["branch"]), ("hello_weft 0.1.0", self.BRANCH))
+        self.assertEqual(base64.b64decode(put["content"]).decode(),
+                         WEFT_FILE.format(commit=self.commit))
+        pr = self.sent[f"POST {self.INDEX}/pulls"]
+        self.assertEqual((pr["title"], pr["head"], pr["base"]),
+                         ("hello_weft 0.1.0", f"someone:{self.BRANCH}", "main"))
+        self.assertEqual(pr["body"], "Submitted with weft-mod-action")
 
-    def test_the_declared_deps_are_set_in_the_pull_request(self):
+    def test_the_declared_deps_are_in_the_file(self):
         self.declare_deps(["base", "cogwork"])
         self.submit()
-        [(call, data)] = self.sent
-        self.assertEqual(call, f"PUT {self.FORK_FILE}")
-        self.assertEqual((data["branch"], data["sha"]), ("hello_weft-0.1.0", "blob1"))
-        self.assertEqual(base64.b64decode(data["content"]).decode(),
-                         'name = "hello_weft"\ndeps = ["cogwork"]\nowner = "someone"\n')
+        put = self.sent[f"PUT {self.FORK}/contents/{self.PATH}"]
+        self.assertIn('\ndeps = ["cogwork"]\n', base64.b64decode(put["content"]).decode())
 
-    def test_a_dry_run_shows_the_deps(self):
+    def test_forks_the_index_when_the_account_has_no_fork(self):
+        del self.responses[self.FORK]
+        self.responses[f"POST {self.INDEX}/forks"] = {"full_name": "someone/Weft-Mods-Index-1"}
+        fork = "/repos/someone/Weft-Mods-Index-1"
+        self.responses[f"{fork}/git/ref/heads/main"] = Answers(
+            [None, weftmod.Error("HTTP 409 Conflict: Git Repository is empty."),
+             {"object": {"sha": self.MAIN}}])
+        self.submit()
+        self.assertEqual(self.sent[f"POST {self.INDEX}/forks"], {"default_branch_only": True})
+        self.assertEqual(self.sleep.call_count, 2)
+        self.assertIn(f"PUT {fork}/contents/{self.PATH}", self.calls)
+        self.assertEqual(self.sent[f"POST {self.INDEX}/pulls"]["head"], f"someone:{self.BRANCH}")
+
+    def test_a_fork_that_never_gets_ready_fails(self):
+        del self.responses[f"{self.FORK}/git/ref/heads/main"]
+        with self.assertRaisesRegex(weftmod.Error, "wasn't ready"):
+            self.submit()
+        self.assertNotIn(f"POST {self.INDEX}/pulls", self.calls)
+
+    def test_a_fork_behind_the_index_still_proposes(self):
+        self.responses[f"POST {self.FORK}/merge-upstream"] = weftmod.Error("HTTP 409 Conflict")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(len(self.submit()), 1)
+        self.assertIn("::warning::", err.getvalue())
+        self.assertEqual(self.sent[f"POST {self.FORK}/git/refs"]["sha"], self.MAIN)
+
+    def test_a_stale_branch_is_moved_to_the_index(self):
+        self.responses[f"{self.FORK}/git/ref/heads/{self.BRANCH}"] = {"object": {"sha": "1" * 40}}
+        self.submit()
+        self.assertEqual(self.sent[f"PATCH {self.FORK}/git/refs/heads/{self.BRANCH}"],
+                         {"sha": self.MAIN, "force": True})
+        self.assertNotIn(f"POST {self.FORK}/git/refs", self.calls)
+
+    def test_a_dry_run_shows_the_file_but_writes_nothing(self):
         self.declare_deps(["base", "cogwork"])
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.submit(dry_run=True)
+            self.assertEqual(self.submit(dry_run=True), [])
+        self.assertEqual(self.writes(), [])
+        self.assertIn(f"would propose {self.PATH}:\n", err.getvalue())
         self.assertIn('deps = ["cogwork"]', err.getvalue())
+        self.assertIn('owner = "someone"', err.getvalue())
 
-    def test_a_dry_run_opens_nothing(self):
-        urls, calls, gh_calls = self.submit(dry_run=True)
-        self.assertEqual(urls, [])
-        self.assertIn("gh=none helper=none", calls[0])
-        self.assertNotIn("/user", gh_calls)
-        self.assertEqual(weftmod.proposed_file(
-            "x\nhttps://github.com/Weft-Rust/Weft-Mods-Index/new/main?filename=mods/a/1.toml"
-            "&value=name%20%3D%20%22a%22%0A\n"), ("mods/a/1.toml", 'name = "a"\n'))
+    def test_a_dry_run_without_a_users_token_names_the_repository_owner(self):
+        self.responses["/user"] = weftmod.Error("HTTP 403 Forbidden")
+        self.REPO = "theirs/mods"
+        self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.commit}
+        self.responses[f"/repos/{self.REPO}/releases/tags/{self.TAG}"] = {"draft": False}
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.submit(dry_run=True)
+        self.assertIn('\nauthor = "theirs"\n', err.getvalue())
+        self.assertIn('\nowner = "theirs"\n', err.getvalue())
+        self.assertIn('\nrepo = "https://github.com/theirs/mods"\n', err.getvalue())
+        self.assertNotIn(f"{self.INDEX}/pulls?state=open&head=someone:{self.BRANCH}", self.calls)
+        with self.assertRaisesRegex(weftmod.Error, "personal access token"):
+            self.submit()
 
     def test_what_the_index_has_or_is_proposed_is_left_out(self):
-        self.responses[f"{self.INDEX}/contents/mods/hello_weft/0.1.0.toml"] = {"type": "file"}
-        self.assertEqual(self.submit()[:2], ([], []))
-        del self.responses[f"{self.INDEX}/contents/mods/hello_weft/0.1.0.toml"]
+        self.responses[f"{self.INDEX}/contents/{self.PATH}"] = {"type": "file"}
+        self.assertEqual(self.submit(), [])
+        self.assertEqual(self.writes(), [])
+        del self.responses[f"{self.INDEX}/contents/{self.PATH}"]
         url = "https://github.com/Weft-Rust/Weft-Mods-Index/pull/3"
-        self.responses[f"{self.INDEX}/pulls?state=open&head=someone:hello_weft-0.1.0"] = [
+        self.responses[f"{self.INDEX}/pulls?state=open&head=someone:{self.BRANCH}"] = [
             {"html_url": url}]
-        self.assertEqual(self.submit()[:2], ([url], []))
+        self.assertEqual(self.submit(), [url])
+        self.assertEqual(self.writes(), [])
 
-    def test_a_stale_branch_is_deleted_first(self):
-        ref = "/repos/someone/Weft-Mods-Index/git/ref/heads/hello_weft-0.1.0"
-        self.responses[ref] = {"ref": "refs/heads/hello_weft-0.1.0"}
-        _, calls, gh_calls = self.submit()
-        self.assertIn("DELETE /repos/someone/Weft-Mods-Index/git/refs/heads/hello_weft-0.1.0",
-                      gh_calls)
-        self.assertEqual(len(calls), 1)
+    def test_a_tag_without_a_release_is_refused(self):
+        for release in (None, {"draft": True}):
+            self.responses[f"/repos/{self.REPO}/releases/tags/{self.TAG}"] = release
+            with self.assertRaisesRegex(weftmod.Error, "has no release of it"):
+                self.submit()
+            self.assertEqual(self.writes(), [])
 
-    def test_a_build_before_leaves_no_dirt(self):
-        # The tag before built here: cargo rewrote Cargo.lock, or wrote an untracked one.
+    def test_weft_sdk_must_be_a_weft_release(self):
+        cargo = self.clone / "hello" / "Cargo.toml"
+        cargo.write_text(cargo.read_text().replace('tag = "v26.11.2"', 'branch = "main"'))
+        subprocess.run(["git", "-C", str(self.clone), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qam", "b"], check=True)
+        self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.head()}
+        with self.assertRaisesRegex(weftmod.Error, "weft_sdk must come from"):
+            self.submit()
+        self.assertEqual(self.writes(), [])
+
+    def test_a_dirty_checkout_is_cleaned(self):
+        # Cargo.lock rewritten, and an untracked file: the file must be of the tagged commit.
         (self.clone / "hello" / "Cargo.lock").write_text("# rewritten\n")
         (self.clone / "hello" / "stray.lock").write_text("# untracked\n")
-        self.assertEqual(len(self.submit()[0]), 1)
+        self.assertEqual(len(self.submit()), 1)
+        self.assertFalse((self.clone / "hello" / "stray.lock").exists())
+        self.assertNotEqual((self.clone / "hello" / "Cargo.lock").read_text(), "# rewritten\n")
 
     def test_a_release_candidate_is_refused(self):
         tag = "hello_weft-v0.1.1-rc.4.gabcdef0"
         self.responses[f"/repos/{self.REPO}/commits/{tag}"] = {"sha": self.commit}
+        self.responses[f"/repos/{self.REPO}/releases/tags/{tag}"] = {"prerelease": True}
         with self.assertRaisesRegex(weftmod.Error, "Cargo.toml says version 0.1.0"):
             self.submit([tag])
 
@@ -385,7 +515,32 @@ class Submit(TempDir):
              "published_at": "2026-11-01T00:00:00Z"}]
         self.assertEqual(weftmod.latest_tags(FakeGitHub(self.responses), self.REPO,
                                              [self.clone / "hello"]), [self.TAG])
-        self.assertEqual(len(self.submit(tags=())[0]), 1)
+        self.assertEqual(len(self.submit(tags=())), 1)
+
+    def test_one_fork_for_several_releases(self):
+        self.declare_deps([])  # a second commit, tagged 0.2.0
+        cargo = self.clone / "hello" / "Cargo.toml"
+        cargo.write_text(cargo.read_text().replace('version = "0.1.0"', 'version = "0.2.0"'))
+        subprocess.run(["git", "-C", str(self.clone), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qam", "v"], check=True)
+        self.responses[f"/repos/{self.REPO}/commits/hello_weft-v0.2.0"] = {"sha": self.head()}
+        self.responses[f"/repos/{self.REPO}/releases/tags/hello_weft-v0.2.0"] = {"draft": False}
+        self.responses[f"/repos/{self.REPO}/commits/{self.TAG}"] = {"sha": self.commit}
+        self.assertEqual(len(self.submit([self.TAG, "hello_weft-v0.2.0"])), 2)
+        self.assertEqual(self.calls.count(self.FORK), 1)
+        self.assertIn(f"PUT {self.FORK}/contents/mods/hello_weft/0.2.0.toml", self.calls)
+
+
+class GitHubErrors(unittest.TestCase):
+    def test_an_error_says_what_github_said(self):
+        body = io.BytesIO(json.dumps({"message": "Validation Failed", "errors": [
+            {"message": "A pull request already exists for someone:m-1.0.0."}]}).encode())
+        err = weftmod.urllib.error.HTTPError("https://api.github.com/x", 422, "Unprocessable",
+                                             {}, body)
+        with mock.patch.object(weftmod.urllib.request, "urlopen", side_effect=err):
+            with self.assertRaisesRegex(weftmod.Error, "HTTP 422 Unprocessable: Validation Failed; "
+                                                        "A pull request already exists"):
+                weftmod.GitHub("t").api("/x", method="POST", data={})
 
 
 if __name__ == "__main__":
