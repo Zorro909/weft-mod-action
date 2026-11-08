@@ -137,8 +137,17 @@ When several mods release in one run, one attestation covers all their zips, and
 Copy [`examples/index-pr.yml`](examples/index-pr.yml) to `.github/workflows/index-pr.yml`, and run
 it from the Actions tab. It forks the index to your account, adds the newest release of each mod
 (or the tags you give) with the index's own `add-release`, which checks each release and writes
-its `{repo, tag}` entry, and opens a pull request. Running it
-again for the same tags updates that pull request.
+its `{repo, tag}` entry, and opens a pull request. Running it again for the same tags updates that
+pull request.
+
+It also sets each mod's summary in the index, from the mod's folder as it is now, and proposes a
+new summary on its own when the releases are in the index already. With no new release and no
+changed summary, it opens no pull request.
+
+The summary is the first of `[package.metadata.weft] summary`, the first sentence of
+`mod.<id>.description` in `assets/lang/en_us.lang`, `[package] description`, and the mod's name. It
+is one line of at most 140 characters, without color markup: a longer one is cut at a comma or a
+word.
 
 It needs a token that can push to your fork and open the pull request, which `GITHUB_TOKEN` can't:
 
@@ -150,16 +159,16 @@ It needs a token that can push to your fork and open the pull request, which `GI
 | --- | --- | --- |
 | `token` | | The token. |
 | `tags` | the newest release of each mod | Release tags, separated by spaces. |
-| `mods` | `.` | The mod folders, to find their newest releases. |
+| `mods` | `.` | The mod folders, for their newest releases and their summaries. A mod new to the index must be one of them. |
 | `index` | `Zorro909/weft-mods-index` | The index repository. |
 | `index-ref` | `main` | Its branch. |
 
-Its output `url` is the pull request.
+Its output `url` is the pull request, empty when there was nothing to propose.
 
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests   # needs cargo for the plan tests
+python3 -m unittest discover -s tests   # needs cargo for the plan and propose tests
 ```
 
 `weftmod.py` does the work, with the Python standard library only, so that it runs on every runner
