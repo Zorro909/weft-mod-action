@@ -184,9 +184,11 @@ It does it all with GitHub's API, without the `weft` binary.
 Its output `urls` is the pull requests, separated by spaces, with those that were open already. It
 runs on Linux, and reads each mod with the runner's `cargo metadata`.
 
-The file, like weft's, has `name`, the mod id; `summary`, `[package] description`; `author` and
-`owner`, the token's account; `repo`, `dir` and `commit`, where to build; and `weft`, the tag of
-`weft_sdk`. Its `deps` are the mod ids the mod needs besides `base` (which weft leaves empty):
+The file, like weft's, has `name`, the mod id; `author` and `owner`, the token's account; `repo`,
+`dir` and `commit`, where to build; and `weft`, the tag of `weft_sdk`. Its `summary`, one line in the
+launcher, is the first sentence (at most 140 characters, without color markup) of the first of
+`[package.metadata.weft] summary`, `mod.<id>.description` in `assets/lang/en_us.lang`, and
+`[package] description`; else the mod's name. Its `deps` are the mod ids the mod needs besides `base` (which weft leaves empty):
 from `[package.metadata.weft] deps`, or else the `deps` of `declare_mod!` in the library's source.
 When `declare_mod!` can't be read as plain string literals (a macro, or several under `#[cfg]`), set
 the deps yourself:

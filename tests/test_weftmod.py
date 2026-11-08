@@ -135,6 +135,43 @@ class Metadata(unittest.TestCase):
                 weftmod.parse_deps(src, "m")
 
 
+class Summary(TempDir):
+    def test_summarize(self):
+        self.assertEqual(weftmod.summarize("{gold}Gears{/} and belts. More later.\\nNext line"),
+                         "Gears and belts.")
+        s = weftmod.summarize("word " * 60)
+        self.assertLessEqual(len(s), weftmod.SUMMARY_MAX)
+        self.assertTrue(s.endswith("…"))
+        # cogwork's: cut at a comma.
+        self.assertEqual(weftmod.summarize(
+            "Item tubes you can see into, engines, and machines that take over the big jobs: an "
+            "excavator that mines out a whole area, an assembly bench that crafts on its own and a "
+            "leveler that makes land flat. Cuboid loaders keep them working with nobody near."),
+            "Item tubes you can see into, engines, and machines that take over the big jobs: an "
+            "excavator that mines out a whole area…")
+
+    def test_lang(self):
+        self.assertEqual(weftmod.parse_lang("# c\na.b = x = y\n\nbad\n"), {"a.b": "x = y"})
+
+    def mod(self, metadata=None, description=None, lang=None):
+        path = self.tmp / "assets" / "lang" / "en_us.lang"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)
+        if lang is not None:
+            path.write_text(lang)
+        package = {"metadata": {"weft": metadata or {}}, "description": description}
+        return mock.Mock(id="m", folder=self.tmp, package=package)
+
+    def test_where_the_summary_comes_from(self):
+        both = "mod.m.name = Em\nmod.m.description = From {red}the{/} lang file. More.\n"
+        self.assertEqual(weftmod.mod_summary(self.mod({"summary": "Set."}, "Cargo.", both)), "Set.")
+        self.assertEqual(weftmod.mod_summary(self.mod({}, "Cargo.", both)), "From the lang file.")
+        self.assertEqual(weftmod.mod_summary(self.mod({}, "From Cargo. More.", "mod.m.name = Em\n")),
+                         "From Cargo.")
+        self.assertEqual(weftmod.mod_summary(self.mod({}, None, "mod.m.name = Em\n")), "Em")
+        self.assertEqual(weftmod.mod_summary(self.mod()), "m")
+
+
 class Folders(TempDir):
     def test_submodules_of_weft(self):
         (self.tmp / ".gitmodules").write_text(
@@ -395,8 +432,10 @@ class Submit(TempDir):
                          {"ref": f"refs/heads/{self.BRANCH}", "sha": self.MAIN})
         put = self.sent[f"PUT {self.FORK}/contents/{self.PATH}"]
         self.assertEqual((put["message"], put["branch"]), ("hello_weft 0.1.0", self.BRANCH))
+        # weft's file, but with the summary from the lang file, whose description comes first.
         self.assertEqual(base64.b64decode(put["content"]).decode(),
-                         WEFT_FILE.format(commit=self.commit))
+                         WEFT_FILE.format(commit=self.commit).replace(
+                             "nothing, for testing weft-mod-action.", "nothing."))
         pr = self.sent[f"POST {self.INDEX}/pulls"]
         self.assertEqual((pr["title"], pr["head"], pr["base"]),
                          ("hello_weft 0.1.0", f"someone:{self.BRANCH}", "main"))

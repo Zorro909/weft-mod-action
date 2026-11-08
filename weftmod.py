@@ -35,6 +35,7 @@ CORE_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 _PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER_RE = re.compile(CORE_RE.pattern + rf"(?:-{_PRE_ID}(?:\.{_PRE_ID})*)?$")
 ID_RE = re.compile(r"^[a-z0-9_]+$")
+SUMMARY_MAX = 140  # one line in the launcher's list
 INDEX = "Weft-Rust/Weft-Mods-Index"  # the mod index, where `submit` proposes
 
 
@@ -368,6 +369,51 @@ def weft_metadata(mod: Mod) -> dict:
     return (mod.package.get("metadata") or {}).get("weft") or {}
 
 
+# ---------------------------------------------------------------------------------------------
+# summary: what the index shows of a mod
+
+
+def parse_lang(text: str) -> dict[str, str]:
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def lang(mod: Mod) -> dict[str, str]:
+    path = mod.folder / "assets" / "lang" / "en_us.lang"
+    return parse_lang(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+
+def mod_name(mod: Mod) -> str:
+    return weft_metadata(mod).get("name") or lang(mod).get(f"mod.{mod.id}.name") or mod.id
+
+
+def mod_summary(mod: Mod) -> str:
+    """The summary for the index: `[package.metadata.weft] summary`, else the first sentence of
+    `mod.<id>.description` in the lang file, else `[package] description`, else the name."""
+    description = (weft_metadata(mod).get("summary") or lang(mod).get(f"mod.{mod.id}.description")
+                   or mod.package.get("description") or "")
+    return summarize(description) or mod_name(mod)
+
+
+def summarize(description: str) -> str:
+    """The description's first sentence on one line, without color markup, at most 140 characters:
+    cut at a comma, or else a word, when it is longer."""
+    text = re.sub(r"\{[^{}]*\}", "", description)
+    text = re.split(r"\\n|\n", text)[0].strip()
+    text = " ".join(re.split(r"(?<=[.!?])\s+", text)[0].split())
+    if len(text) <= SUMMARY_MAX:
+        return text
+    cut = text[:SUMMARY_MAX - 1]
+    comma, space = cut.rfind(", "), cut.rfind(" ")
+    end = comma if comma >= SUMMARY_MAX // 2 else space if space > 0 else SUMMARY_MAX - 1
+    return cut[:end].rstrip(" ,;:") + "…"
+
+
 def mod_deps(mod: Mod) -> list[str]:
     """`[package.metadata.weft] deps`, else the deps of the library's `declare_mod!`."""
     deps = weft_metadata(mod).get("deps")
@@ -503,7 +549,8 @@ def toml_str(s: str) -> str:
 def index_file(mod_id: str, summary: str, owner: str, repo: str, folder: str, commit: str,
                weft: str, deps: list[str]) -> str:
     """`mods/<id>/<version>.toml`, as `weft --submit-mod` writes it (Weft's
-    crates/app/src/submit.rs), but with the mod's `deps`, which weft leaves empty."""
+    crates/app/src/submit.rs), but with the mod's `deps`, which weft leaves empty, and its
+    summary from more than `[package] description` (see mod_summary)."""
     s = toml_str
     return (
         "# Shown in the launcher. The newest version's say what the mod is.\n"
@@ -638,7 +685,7 @@ def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str],
                         f"{SDK_HINT}")
         deps = [d for d in mod_deps(mod) if d not in GAME_MODS]
         folder = mod.folder.relative_to(clone).as_posix()
-        text = index_file(mod.id, mod.package.get("description") or "", login or repo.split("/")[0],
+        text = index_file(mod.id, mod_summary(mod), login or repo.split("/")[0],
                           f"https://github.com/{repo}", "" if folder == "." else folder, commit,
                           weft, deps)
         if dry_run:
