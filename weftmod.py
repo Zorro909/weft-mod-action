@@ -6,7 +6,7 @@ Python 3.10 or newer, so that it runs on every GitHub runner as it is.
     build       set those versions, `cargo build --release`, copy the libraries
     package     merge the runners' builds into each mod's `<id>.zip`  (release/action.yml)
     release     a GitHub release of each zip
-    submit      propose releases to the mod index with `weft --submit-mod`  (index-pr/action.yml)
+    submit      propose releases to the mod index, as `weft --submit-mod` does  (index-pr/action.yml)
 
 A mod is a folder with a Cargo.toml that builds a `cdylib`; its id is that library's name. See
 README.md for the rules.
@@ -35,7 +35,7 @@ CORE_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 _PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER_RE = re.compile(CORE_RE.pattern + rf"(?:-{_PRE_ID}(?:\.{_PRE_ID})*)?$")
 ID_RE = re.compile(r"^[a-z0-9_]+$")
-INDEX = "Weft-Rust/Weft-Mods-Index"  # where `weft --submit-mod` proposes
+INDEX = "Weft-Rust/Weft-Mods-Index"  # the mod index, where `submit` proposes
 
 
 class Error(Exception):
@@ -73,7 +73,7 @@ class GitHub:
                 if e.code == 404:
                     return None
                 if e.code < 500 or attempt == 2:
-                    raise Error(f"{method} {path}: HTTP {e.code} {e.reason}") from None
+                    raise Error(f"{method} {path}: HTTP {e.code} {e.reason}{_why(e)}") from None
             except (OSError, ValueError) as e:
                 if attempt == 2:
                     raise Error(f"{method} {path}: {e}") from None
@@ -87,6 +87,20 @@ class GitHub:
             if len(batch) < 100:
                 return out
             page += 1
+
+
+def _why(e: urllib.error.HTTPError) -> str:
+    """What GitHub says is wrong, from the body of its error."""
+    try:
+        body = json.loads(e.read() or b"{}")
+    except (OSError, ValueError):
+        return ""
+    finally:
+        e.close()
+    why = [body.get("message")] + [x.get("message") or x.get("code") for x in body.get("errors", [])
+                                   if isinstance(x, dict)]
+    why = [w for w in why if w]
+    return f": {'; '.join(why)}" if why else ""
 
 
 def tag_exists(gh: GitHub, repo: str, tag: str) -> bool:
@@ -437,7 +451,7 @@ def latest_tags(gh: GitHub, repo: str, folders: list[Path]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
-# submit: `weft --submit-mod` for each release
+# submit: what `weft --submit-mod` does, for each release
 
 
 def submit_mods(spec: str, clone: Path) -> list[Mod]:
@@ -451,8 +465,7 @@ def submit_mods(spec: str, clone: Path) -> list[Mod]:
                 out.append(Mod(folder))
             except Error as e:
                 raise Error(f"{e}\nThe index builds a mod from its repository alone, without "
-                            f"submodules, so it takes weft_sdk = {{ git = \"https://github.com/"
-                            f"Weft-Rust/Weft\", tag = \"<a Weft release>\" }}") from None
+                            f"submodules, so it takes {SDK_HINT}") from None
     return out
 
 
@@ -463,97 +476,146 @@ def git(cwd: Path, *args: str) -> str:
     return r.stdout.strip()
 
 
-def weft_env(token_user: dict | None, scratch: Path) -> dict:
-    """The environment `weft --submit-mod` runs in. With the token's user: git pushes with the
-    token (through gh) and commits as that user. Without (a dry run): gh is logged out and no
-    browser opens, so weft only prints the pull request it would make."""
-    env = dict(os.environ)
-    if token_user:
-        login = token_user["login"]
-        email = f"{token_user['id']}+{login}@users.noreply.github.com"
-        env.update(GIT_AUTHOR_NAME=login, GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_NAME=login,
-                   GIT_COMMITTER_EMAIL=email, GIT_CONFIG_COUNT="2",
-                   GIT_CONFIG_KEY_0="credential.https://github.com.helper", GIT_CONFIG_VALUE_0="",
-                   GIT_CONFIG_KEY_1="credential.https://github.com.helper",
-                   GIT_CONFIG_VALUE_1="!gh auth git-credential")
-        return env
-    for k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
-        env.pop(k, None)
-    (scratch / "gh").mkdir(parents=True, exist_ok=True)
-    (scratch / "bin").mkdir(exist_ok=True)
-    for opener in ("xdg-open", "open"):
-        shim = scratch / "bin" / opener
-        shim.write_text("#!/bin/sh\nexit 0\n")
-        shim.chmod(0o755)
-    env["GH_CONFIG_DIR"] = str(scratch / "gh")
-    env["PATH"] = f"{scratch / 'bin'}{os.pathsep}{env.get('PATH', '')}"
-    return env
-
-
-def proposed_file(output: str) -> tuple[str, str] | None:
-    """The path and text of the file in the GitHub "new file" link weft prints when it can't open
-    the pull request."""
-    import urllib.parse
-    m = re.search(r"https://github\.com/\S+/new/\S+", output)
-    if not m:
-        return None
-    query = urllib.parse.parse_qs(urllib.parse.urlsplit(m.group(0)).query)
-    if "filename" not in query or "value" not in query:
-        return None
-    return query["filename"][0], query["value"][0]
-
-
+SDK_GIT = "https://github.com/Weft-Rust/Weft"
+SDK_HINT = f'weft_sdk = {{ git = "{SDK_GIT}", tag = "<a Weft release, such as v26.11.3>" }}'
 GAME_MODS = {"base", "core"}  # ship with the game; the index's `deps` leave them out
+PR_BODY = "Submitted with weft-mod-action, which writes the file as `weft --submit-mod` does."
 
 
-def with_deps(text: str, deps: list[str]) -> str | None:
-    """The index file weft wrote, with its `deps` set to these; None when it has no `deps` line."""
-    new, n = re.subn(r"(?m)^deps[ \t]*=[ \t]*\[[^\]\n]*\]", lambda _: "deps = " + json.dumps(deps),
-                     text, count=1)
-    return new if n else None
+# The line the index's scripts/patch_sdk.py sets to the Weft it builds against, which it needs
+# once in the mod's own Cargo.toml (perhaps under [workspace.dependencies]).
+_SDK_RE = re.compile(r'^\s*weft_sdk\s*=\s*\{[^}]*git\s*=\s*"https://github\.com/Weft-Rust/Weft"'
+                     r'[^}]*tag\s*=\s*"([^"]*)"', re.M)
 
 
-def set_deps(gh: GitHub, url: str, path: str, deps: list[str]) -> bool:
-    """Sets `deps` in the file of weft's pull request, with a commit on its branch: weft writes
-    none. Returns whether it changed."""
-    pr = gh.api(f"/repos/{INDEX}/pulls/{url.rsplit('/', 1)[1]}")
-    head, ref = pr["head"]["repo"]["full_name"], pr["head"]["ref"]
-    file = gh.api(f"/repos/{head}/contents/{path}?ref={ref}")
-    if file is None:
-        raise Error(f"{url} has no {path}; set its deps by hand: {deps}")
-    text = base64.b64decode(file["content"]).decode("utf-8")
-    new = with_deps(text, deps)
-    if new is None:
-        raise Error(f"{url}: weft's {path} has no `deps = [...]` line; set its deps by hand: {deps}")
-    if new == text:
-        return False
-    gh.api(f"/repos/{head}/contents/{path}", method="PUT", data={
-        "message": f"{path}: deps = {json.dumps(deps)}", "branch": ref, "sha": file["sha"],
-        "content": base64.b64encode(new.encode("utf-8")).decode()})
-    return True
+def sdk_tag(mod: Mod) -> str | None:
+    """The tag of `weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "..." }` in the
+    mod's Cargo.toml: the Weft the index builds the mod against."""
+    tags = _SDK_RE.findall((mod.folder / "Cargo.toml").read_text(encoding="utf-8"))
+    return tags[0] if len(tags) == 1 and tags[0] else None
 
 
-def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str], weft: str,
+def toml_str(s: str) -> str:
+    """A TOML basic string: JSON's escapes are a subset of TOML's."""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def index_file(mod_id: str, summary: str, owner: str, repo: str, folder: str, commit: str,
+               weft: str, deps: list[str]) -> str:
+    """`mods/<id>/<version>.toml`, as `weft --submit-mod` writes it (Weft's
+    crates/app/src/submit.rs), but with the mod's `deps`, which weft leaves empty."""
+    s = toml_str
+    return (
+        "# Shown in the launcher. The newest version's say what the mod is.\n"
+        f"name = {s(mod_id)}\n"
+        f"summary = {s(summary)}\n"
+        f"author = {s(owner)}\n"
+        "\n"
+        "# What is built: the crate in `dir` of `repo` at `commit`, against the SDK of `weft`.\n"
+        f"repo = {s(repo)}\n"
+        f"dir = {s(folder)}\n"
+        f"commit = {s(commit)}\n"
+        f"weft = {s(weft)}\n"
+        "# Mod ids it needs besides base, installed with it.\n"
+        f"deps = {json.dumps(deps)}\n"
+        "# The GitHub login the id belongs to: only they can add versions.\n"
+        f"owner = {s(owner)}\n"
+        "# Set by a maintainer who read the source of this commit.\n"
+        'reviewed = ""\n')
+
+
+def check_builds(mod: Mod, tag: str) -> None:
+    """`cargo build --release` in the mod's folder, as weft does: what doesn't build here wouldn't
+    on the index either. Its output goes to the log, not to the URLs this prints."""
+    log(f"::group::cargo build --release in {mod.folder} ({tag})")
+    r = subprocess.run(["cargo", "build", "--release"], cwd=mod.folder, stdout=sys.stderr)
+    log("::endgroup::")
+    if r.returncode != 0:
+        raise Error(f"{tag}: it doesn't build here, so it wouldn't on the index either")
+
+
+def index_fork(gh: GitHub, login: str, tries: int = 60) -> tuple[str, str]:
+    """The token's fork of the index (made if it has none) once GitHub has it ready, and the
+    index's default branch."""
+    index = gh.api(f"/repos/{INDEX}")
+    if index is None:
+        raise Error(f"{INDEX}: no such repository")
+    base = index["default_branch"]
+    fork = gh.api(f"/repos/{login}/{INDEX.split('/')[1]}")
+    if not (fork and fork.get("fork") and (fork.get("parent") or {}).get("full_name") == INDEX):
+        # Gives the fork the account has, under whatever name, or makes one.
+        fork = gh.api(f"/repos/{INDEX}/forks", method="POST", data={"default_branch_only": True})
+        log(f"{INDEX} forked to {fork['full_name']}")
+    name = fork["full_name"]
+    for _ in range(tries):  # GitHub forks in the background
+        try:
+            if gh.api(f"/repos/{name}/git/ref/heads/{base}") is not None:
+                break
+        except Error:  # 409 while the fork is still empty
+            pass
+        time.sleep(5)
+    else:
+        raise Error(f"{name}: the fork of {INDEX} wasn't ready after {tries * 5} seconds")
+    # So that the fork has the index's newest commit, which the branch starts at (a fork shares
+    # the index's objects, so the branch works without it too).
+    try:
+        gh.api(f"/repos/{name}/merge-upstream", method="POST", data={"branch": base})
+    except Error as e:
+        log(f"::warning::{name} can't be brought up to date with {INDEX}: {e}")
+    return name, base
+
+
+def propose(gh: GitHub, fork: str, base: str, path: str, text: str, mod_id: str,
+            version: str) -> str:
+    """What `weft --submit-mod` does through gh: the branch `<id>-<version>` of the fork, from the
+    index's newest commit, with the one file; then the pull request. Returns its URL."""
+    branch, title = f"{mod_id}-{version}", f"{mod_id} {version}"
+    sha = gh.api(f"/repos/{INDEX}/git/ref/heads/{base}")["object"]["sha"]
+    if gh.api(f"/repos/{fork}/git/ref/heads/{branch}") is not None:
+        # Left by a run that failed after pushing, or by a closed pull request.
+        gh.api(f"/repos/{fork}/git/refs/heads/{branch}", method="PATCH",
+               data={"sha": sha, "force": True})
+    else:
+        gh.api(f"/repos/{fork}/git/refs", method="POST",
+               data={"ref": f"refs/heads/{branch}", "sha": sha})
+    gh.api(f"/repos/{fork}/contents/{path}", method="PUT", data={
+        "message": title, "branch": branch,
+        "content": base64.b64encode(text.encode("utf-8")).decode()})
+    pr = gh.api(f"/repos/{INDEX}/pulls", method="POST", data={
+        "title": title, "head": f"{fork.split('/')[0]}:{branch}", "base": base, "body": PR_BODY,
+        "maintainer_can_modify": True})
+    return pr["html_url"]
+
+
+def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str],
            dry_run: bool = False) -> list[str]:
-    """Proposes each release to the index with `weft --submit-mod`, from `clone` (a clone of the
-    mod's repository) at the release's commit. The index builds that commit at the version in its
-    Cargo.toml, so the tag must have that version: a full release, not a release candidate.
-    Leaves out releases the index has, and those with an open pull request. Returns the pull
+    """Proposes each release to the index as `weft --submit-mod` does, from `clone` (a clone of
+    the mod's repository) at the release's commit: checks the mod, builds it once, writes
+    `mods/<id>/<version>.toml` and opens a pull request that adds it, from the token's fork of the
+    index. The index builds that commit at the version in its Cargo.toml, so the tag must have that
+    version: a full release, not a release candidate. Leaves out releases the index has, and those
+    with an open pull request. A dry run opens nothing: it prints each file. Returns the pull
     requests."""
-    user = None if dry_run else gh.api("/user")
-    if not dry_run and not (user or {}).get("login"):
+    try:
+        user = gh.api("/user")
+    except Error:  # e.g. a GITHUB_TOKEN, which is no one's
+        user = None
+    login = (user or {}).get("login")
+    if not login and not dry_run:
         raise Error("the token can't tell whose it is (GET /user); is it a personal access token?")
     if not tags:
         tags = latest_tags(gh, repo, [m.folder for m in submit_mods(spec, clone)])
+    fork = None
     urls = []
     for tag in tags:
         mod_id, _, version = tag.partition("-v")
-        branch = f"{mod_id}-{version}"  # weft's
-        if gh.api(f"/repos/{INDEX}/contents/mods/{mod_id}/{version}.toml") is not None:
+        branch = f"{mod_id}-{version}"
+        path = f"mods/{mod_id}/{version}.toml"
+        if gh.api(f"/repos/{INDEX}/contents/{path}") is not None:
             log(f"{tag}: in the index already")
             continue
-        if user:
-            open_prs = gh.api(f"/repos/{INDEX}/pulls?state=open&head={user['login']}:{branch}")
+        if login:
+            open_prs = gh.api(f"/repos/{INDEX}/pulls?state=open&head={login}:{branch}")
             if open_prs:
                 log(f"{tag}: proposed already, {open_prs[0]['html_url']}")
                 urls.append(open_prs[0]["html_url"])
@@ -561,49 +623,39 @@ def submit(gh: GitHub, clone: Path, repo: str, spec: str, tags: list[str], weft:
         commit = (gh.api(f"/repos/{repo}/commits/{tag}") or {}).get("sha")
         if not commit:
             raise Error(f"{tag}: {repo} has no such tag")
-        # A build for the tag before may have left a Cargo.lock: weft wants a clean checkout.
+        # A build for the tag before may have left a Cargo.lock: the index builds the commit.
         git(clone, "checkout", "-q", "--force", "--detach", commit)
         git(clone, "clean", "-q", "-fd")
         mod = next((m for m in submit_mods(spec, clone) if m.id == mod_id), None)
         if mod is None:
             raise Error(f"{tag}: no folder in `mods` holds the mod {mod_id} at {commit[:7]}")
         if mod.package["name"] != mod.id:
-            raise Error(f"{tag}: weft takes the mod id from [package] name, {mod.package['name']}, "
-                        f"which must be the library's name, {mod.id}")
+            raise Error(f"{tag}: the index takes the mod id from [package] name, "
+                        f"{mod.package['name']}, which must be the library's name, {mod.id}")
         if mod.version != version:
             raise Error(f"{tag}: its Cargo.toml says version {mod.version}. The index builds the "
                         f"commit at that version, so only a full release, made from the version "
                         f"in Cargo.toml, can be proposed")
-        # weft writes `deps = []` whatever the mod needs: the deps it declares go in after.
+        weft = sdk_tag(mod)
+        if weft is None:
+            raise Error(f"{tag}: weft_sdk must come from the game's repository at a release tag, "
+                        f"for the index to build it, with one line in the mod's own Cargo.toml: "
+                        f"{SDK_HINT}")
         deps = [d for d in mod_deps(mod) if d not in GAME_MODS]
-        if user and gh.api(f"/repos/{user['login']}/{INDEX.split('/')[1]}/git/ref/heads/{branch}"):
-            # Left by a run that failed after pushing, or by a closed pull request: weft pushes a
-            # new commit to it, which git refuses on top of the old one.
-            gh.api(f"/repos/{user['login']}/{INDEX.split('/')[1]}/git/refs/heads/{branch}",
-                   method="DELETE")
-        log(f"::group::weft --submit-mod {mod.folder.relative_to(clone).as_posix()} ({tag})")
-        r = subprocess.run([weft, "--submit-mod", str(mod.folder)], cwd=mod.folder,
-                           env=weft_env(user, clone.parent / "weft-submit-env"),
-                           stdout=subprocess.PIPE, text=True)
-        log(r.stdout.rstrip())
-        log("::endgroup::")
-        if r.returncode != 0:
-            raise Error(f"{tag}: weft --submit-mod failed; it says why above")
+        folder = mod.folder.relative_to(clone).as_posix()
+        text = index_file(mod.id, mod.package.get("description") or "", login or repo.split("/")[0],
+                          f"https://github.com/{repo}", "" if folder == "." else folder, commit,
+                          weft, deps)
+        log(f"{tag}: building {mod.id} {version} against Weft {weft} to be sure it does")
+        check_builds(mod, tag)
         if dry_run:
-            proposed = proposed_file(r.stdout)
-            if proposed is None:
-                raise Error(f"{tag}: weft printed no file to propose")
-            text = with_deps(proposed[1], deps)
-            if text is None:
-                raise Error(f"{tag}: weft's {proposed[0]} has no `deps = [...]` line")
-            log(f"{tag}: would propose {proposed[0]}:\n{text}")
+            log(f"{tag}: would propose {path}:\n{text}")
             continue
-        m = re.search(r"https://github\.com/\S+/pull/\d+", r.stdout)
-        if not m:
-            raise Error(f"{tag}: weft opened no pull request; it said: {r.stdout.strip()}")
-        urls.append(m.group(0))
-        if set_deps(gh, m.group(0), f"mods/{mod_id}/{version}.toml", deps):
-            log(f"{tag}: set deps = {json.dumps(deps)} in {m.group(0)}")
+        if fork is None:
+            fork = index_fork(gh, login)
+        url = propose(gh, fork[0], fork[1], path, text, mod.id, version)
+        log(f"{tag}: {url}")
+        urls.append(url)
     return urls
 
 # ---------------------------------------------------------------------------------------------
@@ -631,7 +683,6 @@ def main(argv=None) -> int:
     c = sub.add_parser("submit", help="--root is a clone of the mod repository, which it checks out")
     c.add_argument("--mods", default=".")
     c.add_argument("--tags", default="", help="default: the newest full release of each mod")
-    c.add_argument("--weft", required=True, help="the weft binary")
     c.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
 
@@ -651,7 +702,7 @@ def main(argv=None) -> int:
             print(" ".join(release(json.loads((args.dist / "plan.json").read_text()), args.dist,
                                    sha)))
         elif args.command == "submit":
-            print(" ".join(submit(gh, args.root, repo, args.mods, args.tags.split(), args.weft,
+            print(" ".join(submit(gh, args.root, repo, args.mods, args.tags.split(),
                                   args.dry_run)))
     except Error as e:
         print(f"::error::{e}", file=sys.stderr)

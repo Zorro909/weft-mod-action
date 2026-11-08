@@ -1,8 +1,8 @@
 name: Propose Weft mods for the index
 description: >-
-  Proposes releases of this repository's mods to the Weft mod index (Weft-Rust/Weft-Mods-Index)
-  with Weft's own `weft --submit-mod`: one pull request per release, which adds the file the index
-  builds the release's commit from. Runs on Linux.
+  Proposes releases of this repository's mods to the Weft mod index (Weft-Rust/Weft-Mods-Index) as
+  Weft's `weft --submit-mod` does: one pull request per release, from the token's fork of the
+  index, which adds the file the index builds the release's commit from. Runs on Linux.
 inputs:
   token:
     description: >-
@@ -18,14 +18,8 @@ inputs:
   mods:
     description: The mod folders, one per line, relative to the repository root.
     default: "."
-  weft-version:
-    description: >-
-      The Weft whose `weft --submit-mod` runs. `latest`: the newest release, or Weft's default
-      branch, built here, while no release has --submit-mod. Otherwise a release tag, or a branch or
-      commit of Weft-Rust/Weft to build.
-    default: latest
   rust-toolchain:
-    description: The Rust toolchain to install, for weft's test build of the mod; empty to use the runner's.
+    description: The Rust toolchain to install, for the test build of each mod; empty to use the runner's.
     default: stable
   dry-run:
     description: Run everything, but only print each file instead of opening the pull requests.
@@ -46,87 +40,25 @@ runs:
       with:
         toolchain: ${{ inputs.rust-toolchain }}
 
-    # The weft binary: a release's, if it has --submit-mod, or else built from source.
-    - id: weft
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.token }}
-        WEFT: ${{ inputs.weft-version }}
-      run: |
-        set -euo pipefail
-        dir="$RUNNER_TEMP/weft-cli"
-        rm -rf "$dir" && mkdir -p "$dir"
-        ref=$WEFT tag=
-        if [ "$ref" = latest ]; then
-          tag=$(gh release view --repo Weft-Rust/Weft --json tagName --jq .tagName)
-        elif gh release view "$ref" --repo Weft-Rust/Weft >/dev/null 2>&1; then
-          tag=$ref
-        fi
-        if [ -n "$tag" ]; then
-          gh release download "$tag" --repo Weft-Rust/Weft --pattern '*-linux-x64.tar.gz' \
-            --output "$dir/weft.tar.gz"
-          tar -xzf "$dir/weft.tar.gz" -C "$dir"
-          bin=$(find "$dir" -type f -name weft -perm -u+x | head -n 1)
-          if [ -n "$bin" ] && grep -qa -- '--submit-mod' "$bin"; then
-            if ldd "$bin" | grep -q 'not found'; then # libasound, on a runner without it
-              sudo apt-get update -qq
-              sudo apt-get install -y -qq libasound2t64 || sudo apt-get install -y -qq libasound2
-            fi
-            echo "weft $tag"
-            echo "bin=$bin" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ "$WEFT" != latest ]; then
-            echo "::error::Weft $tag has no weft --submit-mod" && exit 1
-          fi
-          ref=$(gh api repos/Weft-Rust/Weft --jq .default_branch)
-          echo "Weft $tag has no weft --submit-mod yet: building Weft's $ref"
-        fi
-        sha=$(gh api "repos/Weft-Rust/Weft/commits/$ref" --jq .sha)
-        echo "weft $ref, $sha, built from source"
-        echo "sha=$sha" >> "$GITHUB_OUTPUT"
-        echo "bin=$HOME/.cache/weft-mod-action/weft-$sha/bin/weft" >> "$GITHUB_OUTPUT"
-
-    - if: steps.weft.outputs.sha != ''
-      id: cache
-      uses: actions/cache@v6
-      with:
-        path: ~/.cache/weft-mod-action/weft-${{ steps.weft.outputs.sha }}
-        key: weft-cli-${{ steps.weft.outputs.sha }}-${{ runner.os }}-${{ runner.arch }}
-
-    - if: steps.weft.outputs.sha != '' && steps.cache.outputs.cache-hit != 'true'
-      shell: bash
-      env:
-        SHA: ${{ steps.weft.outputs.sha }}
-        CARGO_PROFILE_RELEASE_DEBUG: "false"
-        CARGO_PROFILE_RELEASE_STRIP: "true"
-      run: |
-        set -euo pipefail
-        sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev pkg-config
-        cargo install --locked --git https://github.com/Weft-Rust/Weft --rev "$SHA" weft \
-          --root "$HOME/.cache/weft-mod-action/weft-$SHA"
-
     - id: submit
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.token }}
         GITHUB_TOKEN: ${{ inputs.token }}
         TAGS: ${{ inputs.tags }}
         MODS: ${{ inputs.mods }}
-        WEFT_BIN: ${{ steps.weft.outputs.bin }}
         DRY_RUN: ${{ inputs.dry-run }}
       run: |
         set -euo pipefail
         source "$GITHUB_ACTION_PATH/../python.sh"
-        # weft builds and proposes a pushed commit, from a clean checkout with its origin on GitHub:
-        # a clone of its own, so the workflow's checkout needn't be either.
+        # Each release is built and proposed from a clean checkout of its tag's commit: a clone of
+        # its own, so the workflow's checkout needn't be one.
         clone="$RUNNER_TEMP/weft-mod-source/repo"
         rm -rf "$clone"
         git clone -q --filter=blob:none "https://github.com/$GITHUB_REPOSITORY.git" "$clone"
         flag=()
         if [ "$DRY_RUN" = true ]; then flag=(--dry-run); fi
         urls=$(python "$GITHUB_ACTION_PATH/../weftmod.py" --root "$clone" submit --mods "$MODS" \
-          --tags "$TAGS" --weft "$WEFT_BIN" "${flag[@]}")
+          --tags "$TAGS" "${flag[@]}")
         echo "urls=$urls" >> "$GITHUB_OUTPUT"
         if [ -z "$urls" ]; then
           echo "Nothing proposed." | tee -a "$GITHUB_STEP_SUMMARY"

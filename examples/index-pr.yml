@@ -1,7 +1,7 @@
 # Copy to .github/workflows/index-pr.yml in your mod's repository, and add a personal access token
 # as the secret WEFT_INDEX_TOKEN (see README.md). Run it from the Actions tab: it proposes your
-# newest full releases, or the tags you name, to the Weft mod index with `weft --submit-mod`, one
-# pull request each. To propose every full release as it is made instead, see release.yml.
+# newest full releases, or the tags you name, to the Weft mod index as `weft --submit-mod` does,
+# one pull request each. To propose every full release as it is made instead, see release.yml.
 name: Propose to the Weft mod index
 
 on:
