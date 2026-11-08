@@ -1,13 +1,13 @@
 # weft-mod-action
 
 GitHub Actions that release [Weft](https://github.com/Weft-Rust/Weft) mods and propose them to the
-[Weft mod index](https://github.com/Zorro909/weft-mods-index).
+[Weft mod index](https://github.com/Weft-Rust/Weft-Mods-Index).
 
 - **`build`** decides which mods to release and at which version, then builds them with cargo on
   the runner it runs on. Run it on Windows, Linux and macOS.
 - **`release`** packs each mod into `<id>.zip`, attests its build provenance into
   `<id>.mod.json`, and creates a GitHub release of each.
-- **`index-pr`** opens a pull request on the mod index that adds releases.
+- **`index-pr`** proposes releases to the mod index with Weft's own `weft --submit-mod`.
 
 They are composite actions, so they run as steps of your own workflow. The provenance attestation
 then names your repository's workflow as its signer, which is what the index and the launcher
@@ -93,7 +93,9 @@ version it releases, so that the library reports it, but doesn't commit that cha
 | `attest` | `true` | Attest the zips' build provenance, into their `<id>.mod.json`. A GitHub release needs this. |
 | `require-platforms` | `windows-x64 linux-x64 macos-arm64` | The platforms every zip must have. |
 
-Both have the output `tags`: the tags released, separated by spaces.
+Both have the output `tags`: the tags released, separated by spaces. `release` also has the output
+`releases`: the full releases (`X.Y.Z`, no release candidates) it made, which
+[can go to the index](#on-every-full-release).
 
 ### What a release holds
 
@@ -101,69 +103,106 @@ Each release has two assets, which the launcher reads:
 
 | Asset | Content |
 | --- | --- |
-| `<id>.zip` | `weft-mod.toml`, the Windows, Linux and macOS libraries (`<id>.dll`, `lib<id>.so`, `lib<id>.dylib`) at its top, and the mod's `assets/` folder |
+| `<id>.zip` | The Windows, Linux and macOS libraries (`<id>.dll`, `lib<id>.so`, `lib<id>.dylib`) at its top, and the mod's `assets/` folder, as `weft --pack-mod` packs them |
 | `<id>.mod.json` | `{"attestation": <bundle>}`: the Sigstore bundle of the zip's build provenance attestation, as `actions/attest-build-provenance` writes it |
-
-`weft-mod.toml` says:
-
-```toml
-id = "cogwork"
-name = "Cogwork"
-version = "0.2.0"
-abi = "f470b1cbb1f9ad91"
-deps = ["base"]
-```
-
-| Field | From, in order |
-| --- | --- |
-| `id`, `version` | The library's name, and the version released (see above) |
-| `name` | `[package.metadata.weft] name`; `mod.<id>.name` in `assets/lang/en_us.lang`; the id |
-| `abi` | The FNV-1a-64 of `src/lib.rs` of the `weft_abi` crate the mod builds against (Weft's `crates/abi/src/lib.rs`), from a git dependency or a path into a Weft checkout, such as a submodule |
-| `deps` | `[package.metadata.weft] deps`; the `deps` of `declare_mod!` in the library's source |
-
-When `declare_mod!` can't be read as plain string literals (a macro, or several under `#[cfg]`),
-set the deps yourself:
-
-```toml
-[package.metadata.weft]
-deps = ["base"]
-```
 
 When several mods release in one run, one attestation covers all their zips, and each
 `<id>.mod.json` holds that bundle.
 
 ## Proposing to the index
 
-Copy [`examples/index-pr.yml`](examples/index-pr.yml) to `.github/workflows/index-pr.yml`, and run
-it from the Actions tab. It forks the index to your account, adds the newest release of each mod
-(or the tags you give) with the index's own `add-release`, which checks each release and writes
-its `{repo, tag}` entry, and opens a pull request. Running it again for the same tags updates that
-pull request.
+The [Weft mod index](https://github.com/Weft-Rust/Weft-Mods-Index) builds each mod itself, from
+its source at the commit proposed, and lists it in the launcher. `index-pr` proposes a release
+the way the index asks: it runs [`weft --submit-mod`](https://github.com/Weft-Rust/Weft-Mods-Index#sending-a-mod)
+at the commit of the release's tag. So the pull request is always in the form the current Weft
+writes. Each release is one pull request, which adds `mods/<id>/<version>.toml`.
 
-It also sets each mod's summary in the index, from the mod's folder as it is now, and proposes a
-new summary on its own when the releases are in the index already. With no new release and no
-changed summary, it opens no pull request.
+The index builds the mod's folder alone, without submodules, at the version in its `Cargo.toml`.
+So a mod it takes:
 
-The summary is the first of `[package.metadata.weft] summary`, the first sentence of
-`mod.<id>.description` in `assets/lang/en_us.lang`, `[package] description`, and the mod's name. It
-is one line of at most 140 characters, without color markup: a longer one is cut at a comma or a
-word.
+- takes the SDK from the game's repository at a release tag:
+  `weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "v26.11.3" }`;
+- has a `[package] name` that is its library's name, the mod id;
+- is proposed at a release of the version in its `Cargo.toml`. A release candidate that `build`
+  made (`X.Y.(Z+1)-rc.<run>.g<sha7>`) has another version than its commit's `Cargo.toml`, so
+  `index-pr` refuses it. By default it proposes full releases (`X.Y.Z`); a prerelease set in
+  `Cargo.toml`, such as `X.Y.Z-rc.1`, goes only when named in `tags`.
 
-It needs a token that can push to your fork and open the pull request, which `GITHUB_TOKEN` can't:
+It needs a token that can fork the index and open the pull request, which `GITHUB_TOKEN` can't:
 
 1. Create a [classic personal access token](https://github.com/settings/tokens/new) with the scope
-   `public_repo`.
+   `public_repo`. The mod ids are its account's: only it can propose more versions of them.
 2. Add it to your mod's repository as the Actions secret `WEFT_INDEX_TOKEN`.
+
+### By hand
+
+Copy [`examples/index-pr.yml`](examples/index-pr.yml) to `.github/workflows/index-pr.yml`, and run
+it from the Actions tab. It proposes the newest full release of each mod, or the tags you give.
+With `dry-run`, it only shows the file each pull request would add.
+
+### On every full release
+
+[`examples/release.yml`](examples/release.yml) has an `index-pr` job that proposes each full
+release as `release` makes it. It is off until you set the repository variable `WEFT_INDEX_PR` to
+`true` (Settings → Secrets and variables → Actions → Variables) and add the secret
+`WEFT_INDEX_TOKEN`:
+
+```yaml
+  release:
+    # ...
+    outputs:
+      releases: ${{ steps.release.outputs.releases }}
+    steps:
+      # ...
+      - id: release
+        uses: Zorro909/weft-mod-action/release@v2
+
+  index-pr:
+    needs: release
+    if: needs.release.outputs.releases != '' && vars.WEFT_INDEX_PR == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Zorro909/weft-mod-action/index-pr@v2
+        with:
+          token: ${{ secrets.WEFT_INDEX_TOKEN }}
+          tags: ${{ needs.release.outputs.releases }}
+```
+
+### What it does
+
+For each tag, `index-pr`:
+
+1. leaves it out when the index has that version, or when the token's account has an open pull
+   request for it;
+2. clones your repository and checks out the tag's commit;
+3. runs `weft --submit-mod <folder>` with the token. weft builds the mod once, forks the index to
+   the token's account and opens the pull request.
+
+The `weft` binary comes from the newest Weft release. While no release has `--submit-mod` yet, it
+is built from Weft's default branch, which takes a few minutes the first time and is cached
+afterwards.
 
 | Input | Default | |
 | --- | --- | --- |
 | `token` | | The token. |
-| `tags` | the newest release of each mod | Release tags, separated by spaces. |
-| `mods` | `.` | The mod folders, for their newest releases and their summaries. A mod new to the index must be one of them. |
-| `index` | `Zorro909/weft-mods-index` | The index repository. |
-| `index-ref` | `main` | Its branch. |
+| `tags` | the newest full release of each mod | Release tags, separated by spaces. |
+| `mods` | `.` | The mod folders. |
+| `weft-version` | `latest` | The Weft whose `weft --submit-mod` runs: `latest`, a release tag, or a branch or commit of Weft to build. |
+| `rust-toolchain` | `stable` | The toolchain for weft's test build; empty to use the runner's. |
+| `dry-run` | `false` | Only show each file; open no pull request. |
 
-Its output `url` is the pull request, empty when there was nothing to propose.
+Its output `urls` is the pull requests, separated by spaces. It runs on Linux.
+
+weft writes the file as it sees fit: at present `name` is the mod id and `summary` is
+`[package] description`. Its `deps` it leaves empty, so `index-pr` sets them, with a commit on the
+pull request's branch: the mod ids the mod needs besides `base`, from `[package.metadata.weft] deps`,
+or else the `deps` of `declare_mod!` in the library's source. When `declare_mod!` can't be read as
+plain string literals (a macro, or several under `#[cfg]`), set the deps yourself:
+
+```toml
+[package.metadata.weft]
+deps = ["base", "cogwork"]
+```
 
 ## Development
 

@@ -22,6 +22,11 @@ outputs:
   tags:
     description: The tags released, separated by spaces; empty when there was nothing new.
     value: ${{ steps.package.outputs.tags }}
+  releases:
+    description: >-
+      The tags of the full releases this run made (`X.Y.Z`; no release candidates), separated by
+      spaces: what can be proposed to the mod index. Empty without `github-release`.
+    value: ${{ steps.release.outputs.releases }}
 runs:
   using: composite
   steps:
@@ -57,6 +62,7 @@ runs:
           --bundles "$BUNDLES"
 
     - if: steps.package.outputs.tags != '' && inputs.github-release == 'true'
+      id: release
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -64,6 +70,9 @@ runs:
       run: |
         source "$GITHUB_ACTION_PATH/../python.sh"
         python "$GITHUB_ACTION_PATH/../weftmod.py" release --dist "$RUNNER_TEMP/weft-mod-dist"
+        releases=$(python -c 'import json,sys; print(" ".join(e["tag"] for e in json.load(open(sys.argv[1])) if e["kind"] == "release"))' \
+          "$RUNNER_TEMP/weft-mod-dist/plan.json")
+        echo "releases=$releases" >> "$GITHUB_OUTPUT"
 
     - if: steps.package.outputs.tags != ''
       uses: actions/upload-artifact@v7

@@ -1,14 +1,19 @@
 # Copy to .github/workflows/index-pr.yml in your mod's repository, and add a personal access token
-# as the secret WEFT_INDEX_TOKEN (see README.md). Run it from the Actions tab: it opens a pull
-# request on the Weft mod index that adds your newest releases, or the tags you name.
+# as the secret WEFT_INDEX_TOKEN (see README.md). Run it from the Actions tab: it proposes your
+# newest full releases, or the tags you name, to the Weft mod index with `weft --submit-mod`, one
+# pull request each. To propose every full release as it is made instead, see release.yml.
 name: Propose to the Weft mod index
 
 on:
   workflow_dispatch:
     inputs:
       tags:
-        description: Release tags, separated by spaces (default, the newest release of each mod)
+        description: Release tags, separated by spaces (default, the newest full release of each mod)
         default: ""
+      dry-run:
+        description: Only show what would be proposed
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,12 +22,11 @@ jobs:
   index-pr:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - id: pr
-        uses: Zorro909/weft-mod-action/index-pr@v2
+      - uses: Zorro909/weft-mod-action/index-pr@v2
         with:
           token: ${{ secrets.WEFT_INDEX_TOKEN }}
           tags: ${{ inputs.tags }}
+          dry-run: ${{ inputs.dry-run }}
           # mods: |
           #   cogwork
           #   structures
