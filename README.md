@@ -62,8 +62,9 @@ For each mod, `build` reads the version in its `Cargo.toml`:
 | exists, and the mod changed since its newest tag | A release candidate after the newer of that version and the newest full release (`X.Y.Z`; release candidates don't count): `X.Y.(Z+1)-rc.<run>.g<sha7>`, for example `0.2.2-rc.57.g1a2b3c4`. `<run>` is the workflow's run number, `<sha7>` the commit. |
 | exists, and the mod didn't change since its newest tag | Nothing. Set `release-unchanged: true` to make a release candidate anyway. |
 
-A mod changed when a file under its folder, or a Weft submodule, changed. For a mod at the
-repository root, any file counts.
+A mod changed when a file changed under its folder, a Weft submodule, or the folder of a crate
+in the repository that it depends on by `path` (and theirs; not `[dev-dependencies]`). For a mod
+at the repository root, any file counts.
 
 To release a version, set it in `Cargo.toml` and push. The build sets `[package] version` to the
 version it releases, so that the library reports it, but doesn't commit that change. A
