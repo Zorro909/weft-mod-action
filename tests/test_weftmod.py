@@ -226,6 +226,68 @@ class Plan(unittest.TestCase):
         [e] = self.plan({**self.tags("0.1.0"), **same}, release_unchanged=True)
         self.assertEqual(e["version"], "0.1.1-rc.42.g0123456")
 
+    def test_a_path_inside_a_moved_submodule_changed(self):
+        moved = {f"/repos/{self.REPO}/compare/t...{SHA}": {"files": [{"filename": "vendor/x"}]}}
+        gh = FakeGitHub(moved)
+        self.assertTrue(weftmod.changed_since(gh, self.REPO, "t", SHA, ["vendor/x/crates/a"]))
+        self.assertFalse(weftmod.changed_since(gh, self.REPO, "t", SHA, ["vendor/xy"]))
+
+
+class SharedCode(TempDir):
+    """A mod changes with the crates of the repository it depends on by path."""
+    REPO = "someone/mods"
+
+    def crate(self, folder, name, deps="", lib=False):
+        (self.tmp / folder / "src").mkdir(parents=True)
+        (self.tmp / folder / "src" / "lib.rs").write_text("")
+        (self.tmp / folder / "Cargo.toml").write_text(
+            f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
+            + ('[lib]\ncrate-type = ["cdylib"]\n[workspace]\n' if lib else "") + deps)
+
+    def setUp(self):
+        super().setUp()
+        self.crate("repo/m", "m", lib=True, deps=(
+            '[dependencies]\napi = { path = "api" }\nlib = { path = "../lib" }\n'
+            'outside = { path = "../../outside" }\n'
+            '[dev-dependencies]\ntesting = { path = "../testing" }\n'))
+        self.crate("repo/m/api", "api")
+        self.crate("repo/lib", "lib", deps='[dependencies]\nshared = { path = "../shared" }\n')
+        self.crate("repo/shared", "shared")
+        self.crate("repo/testing", "testing")
+        self.crate("outside", "outside")
+        self.root = self.tmp / "repo"
+
+    def plan(self, changed):
+        responses = {
+            f"/repos/{self.REPO}/git/matching-refs/tags/m-v": [{"ref": "refs/tags/m-v0.1.0"}],
+            f"/repos/{self.REPO}/git/ref/tags/m-v0.1.0": {},
+            f"/repos/{self.REPO}/compare/m-v0.1.0...{SHA}": {"files": [{"filename": changed}]}}
+        return weftmod.plan(FakeGitHub(responses), self.root, [self.root / "m"], self.REPO, SHA,
+                            "42")
+
+    def test_what_a_mod_is_built_from(self):
+        mod = weftmod.Mod(self.root / "m")
+        self.assertEqual(weftmod.watched_paths(self.root, "m", mod, ["weft"]),
+                         ["m", "weft", "lib", "shared"])
+
+    def test_a_change_to_a_crate_it_depends_on_makes_a_candidate(self):
+        [e] = self.plan("shared/src/lib.rs")
+        self.assertEqual(e["version"], "0.1.1-rc.42.g0123456")
+
+    def test_a_change_to_a_dev_dependency_doesnt(self):
+        self.assertEqual(self.plan("testing/src/lib.rs"), [])
+
+    def test_a_crate_at_the_root_is_everything(self):
+        (self.root / "Cargo.toml").write_text(
+            '[package]\nname = "top"\nversion = "0.1.0"\nedition = "2021"\n')
+        (self.root / "src").mkdir()
+        (self.root / "src" / "lib.rs").write_text("")
+        toml = self.root / "m" / "Cargo.toml"
+        toml.write_text(toml.read_text().replace(
+            "[dependencies]\n", '[dependencies]\ntop = { path = ".." }\n'))
+        mod = weftmod.Mod(self.root / "m")
+        self.assertEqual(weftmod.watched_paths(self.root, "m", mod, []), [""])
+
 
 class Pack(TempDir):
     def libraries(self):
@@ -282,6 +344,14 @@ class MergeBuilds(TempDir):
         self.build("windows", [{"id": "m", "tag": "m-v1.0.1-rc.1.gabcdef0"}], [])
         with self.assertRaisesRegex(weftmod.Error, "planned different releases"):
             weftmod.merge_builds(self.tmp / "artifacts", self.tmp / "out")
+
+    def test_nothing_planned_packages_nothing(self):
+        for name in ("linux", "windows"):
+            (self.tmp / "artifacts" / name / "libraries").mkdir(parents=True)
+            (self.tmp / "artifacts" / name / "plan.json").write_text("[]")
+        dist = self.tmp / "dist"
+        self.assertEqual(weftmod.package(self.tmp, self.tmp / "artifacts", dist, []), [])
+        self.assertEqual(json.loads((dist / "plan.json").read_text()), [])
 
 
 # The fixture's file, as `weft --submit-mod` writes it at Weft 85f85db (crates/app/src/submit.rs),

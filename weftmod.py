@@ -143,6 +143,31 @@ class Mod:
         if not SEMVER_RE.match(self.version):
             raise Error(f"{folder}: version {self.version} is not X.Y.Z or X.Y.Z-<prerelease>")
 
+    def path_dependencies(self) -> list[Path]:
+        """The folders of the crates the library is built from by `path = "..."`, theirs too, but
+        not dev-dependencies: a change in one changes the mod."""
+        known = {Path(p["manifest_path"]).resolve().parent: p for p in self.metadata["packages"]}
+        seen: set[Path] = set()
+        todo = [self.package]
+        while todo:
+            for dep in todo.pop()["dependencies"]:
+                if not dep.get("path") or dep.get("kind") == "dev":
+                    continue
+                folder = Path(dep["path"]).resolve()
+                if folder in seen:
+                    continue
+                seen.add(folder)
+                if folder not in known:
+                    try:
+                        known.update({Path(p["manifest_path"]).resolve().parent: p
+                                      for p in cargo_metadata(folder)["packages"]})
+                    except Error as e:
+                        log(f"::warning::{self.id}: {e}; a change to what {folder.name} depends "
+                            f"on by path won't count as a change to {self.id}")
+                if folder in known:
+                    todo.append(known[folder])
+        return sorted(seen)
+
 
 def mod_folders(spec: str, root: Path) -> list[Path]:
     """The `mods` input: one folder per line (or separated by spaces), relative to the root."""
@@ -182,12 +207,32 @@ def semver_key(version: str) -> tuple:
 
 def changed_since(gh: GitHub, repo: str, tag: str, sha: str, paths: list[str]) -> bool:
     """Whether any file under `paths` (repository-relative; "" is everything) differs between the
-    tag and the commit."""
+    tag and the commit. A path inside a submodule changed when the submodule moved."""
     cmp = gh.api(f"/repos/{repo}/compare/{tag}...{sha}")
     if cmp is None or cmp.get("files") is None or len(cmp["files"]) >= 300:
         return True  # can't tell (GitHub lists at most 300 files): assume it changed
-    return any(f["filename"] == p or f["filename"].startswith(p.rstrip("/") + "/") or p == ""
+    return any(p == "" or f["filename"] == p or f["filename"].startswith(p.rstrip("/") + "/")
+               or p.startswith(f["filename"] + "/")
                for f in cmp["files"] for p in paths)
+
+
+def watched_paths(root: Path, rel: str, mod: Mod, submodules: list[str]) -> list[str]:
+    """What a mod changes with, repository-relative: its folder ("" for the root, which is
+    everything), the Weft submodules, and the crates in the repository it depends on by path."""
+    if not rel:
+        return [""]
+    root = root.resolve()
+    deps = []
+    for folder in mod.path_dependencies():
+        try:
+            dep = folder.relative_to(root).as_posix()
+        except ValueError:
+            continue  # outside the repository: GitHub can't tell whether it changed
+        if dep == ".":
+            return [""]  # the crate at the root: any file counts
+        if dep != rel and not dep.startswith(rel + "/"):
+            deps.append(dep)
+    return [rel, *submodules, *deps]
 
 
 def weft_submodules(root: Path) -> list[str]:
@@ -205,7 +250,7 @@ def plan(gh: GitHub, root: Path, folders: list[Path], repo: str, sha: str, run: 
     """One entry per mod to release: its folder, id, version and tag, `rc` or `release`, and the
     tag it follows. A mod whose version is released already becomes the next release candidate
     after it, or after the mod's newest full release if that is newer (candidates never raise it);
-    unless nothing under its folder (or a Weft submodule) changed since its newest tag, when it is
+    unless nothing it is built from (`watched_paths`) changed since its newest tag, when it is
     left out."""
     out = []
     submodules = weft_submodules(root)
@@ -216,9 +261,10 @@ def plan(gh: GitHub, root: Path, folders: list[Path], repo: str, sha: str, run: 
         versions = tag_versions(gh, repo, mod.id)
         version, since = mod.version, f"{mod.id}-v{versions[-1]}" if versions else None
         if tag_exists(gh, repo, f"{mod.id}-v{version}"):
-            if not release_unchanged and since and not changed_since(
-                    gh, repo, since, sha, [rel, *submodules] if rel else [""]):
-                log(f"{mod.id}: nothing changed since {since}, nothing to release")
+            paths = watched_paths(root, rel, mod, submodules)
+            if not release_unchanged and since and not changed_since(gh, repo, since, sha, paths):
+                where = ", ".join(paths) if paths != [""] else "the repository"
+                log(f"{mod.id}: nothing changed in {where} since {since}, nothing to release")
                 continue
             released = [v for v in versions if "-" not in v]
             version = rc_version(max([version, *released], key=semver_key), run, sha)
@@ -456,7 +502,9 @@ def package(root: Path, artifacts: Path, dist: Path, require: list[str]) -> list
         if missing:
             raise Error(f"{e['id']}: no build for {', '.join(missing)}")
         log(f"{e['tag']}: {', '.join(platforms)}")
-    shutil.rmtree(libraries)
+    if libraries.exists():  # not when nothing was planned
+        shutil.rmtree(libraries)
+    dist.mkdir(parents=True, exist_ok=True)
     (dist / "plan.json").write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
     return entries
 

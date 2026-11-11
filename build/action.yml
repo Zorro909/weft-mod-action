@@ -7,7 +7,7 @@ inputs:
     description: The mod folders, one per line, relative to the repository root.
     default: "."
   release-unchanged:
-    description: Also release a mod when nothing in its folder changed since its newest release.
+    description: Also release a mod when nothing it is built from changed since its newest release.
     default: "false"
   cargo-args:
     description: More arguments for `cargo build --release`, such as `--features x`.
